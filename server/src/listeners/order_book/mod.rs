@@ -142,6 +142,11 @@ impl OrderBookListener {
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
     }
+
+    /// Get L2 snapshots for history recording (returns time + all L2 snapshot params per coin)
+    pub(crate) fn l2_snapshots(&self) -> Option<(u64, L2Snapshots)> {
+        self.order_book_state.as_ref().map(|s| s.l2_snapshots_uncached())
+    }
 }
 
 impl OrderBookListener {

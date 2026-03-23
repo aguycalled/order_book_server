@@ -1,4 +1,5 @@
 use crate::{
+    history::{self, L2History},
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen_hft,
     },
@@ -63,6 +64,36 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         });
     }
 
+    // Open L2 history database
+    let history_db_path = config.history_db_path.clone().unwrap_or_else(|| {
+        let base = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| dirs::home_dir().expect("Could not find home directory"));
+        base.join("l2_history.rocksdb")
+    });
+    let l2_history = Arc::new(
+        L2History::open(history_db_path.clone()).unwrap_or_else(|e| {
+            panic!("Failed to open L2 history database at {}: {}", history_db_path.display(), e)
+        }),
+    );
+    info!("L2 history database opened at {}", history_db_path.display());
+
+    // Spawn 15-minute L2 snapshot recording task
+    {
+        let l2_history = l2_history.clone();
+        let listener = listener.clone();
+        tokio::spawn(async move {
+            // Wait 30s for initial snapshot to be ready
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+            loop {
+                interval.tick().await;
+                l2_history.record_snapshots(&listener).await;
+            }
+        });
+    }
+
     let websocket_opts =
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
 
@@ -108,7 +139,9 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                     axum::response::Response::builder().header("content-type", "application/json").body(body).unwrap()
                 }
             }),
-        );
+        )
+        .route("/history/l2", get(history::history_handler))
+        .with_state(l2_history);
 
     let tcp_listener = TcpListener::bind(&config.address).await?;
     info!("WebSocket server running at ws://{}", config.address);

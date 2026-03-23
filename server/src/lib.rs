@@ -1,4 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+pub mod history;
 mod listeners;
 pub mod metrics;
 mod order_book;
@@ -55,4 +56,6 @@ pub struct ServerConfig {
     /// BBO-only mode: lightweight mode that only tracks best bid/ask per coin
     /// Disables L2/L4/Trades subscriptions but uses ~100MB RAM instead of 2-3GB
     pub bbo_only: bool,
+    /// Path to the L2 history RocksDB database (optional override)
+    pub history_db_path: Option<PathBuf>,
 }

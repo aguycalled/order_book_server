@@ -20,6 +20,12 @@ pub(crate) struct OrderBook<O> {
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot<O>([Vec<O>; 2]);
 
+impl<O> Snapshot<O> {
+    pub(crate) const fn new(levels: [Vec<O>; 2]) -> Self {
+        Self(levels)
+    }
+}
+
 impl<O: Clone> Snapshot<O> {
     pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
         &self.0

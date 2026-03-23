@@ -84,6 +84,11 @@ struct Args {
     #[arg(long, default_value = "false")]
     bbo_only: bool,
 
+    /// Path to the L2 history RocksDB database.
+    /// Default: <data_dir>/l2_history.rocksdb (or ~/l2_history.rocksdb)
+    #[arg(long)]
+    history_db_path: Option<PathBuf>,
+
     /// Log level: error, warn, info, debug, trace
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -147,6 +152,7 @@ async fn main() -> Result<()> {
         visor_state_path: args.visor_state_path,
         metrics_port: args.metrics_port,
         bbo_only: args.bbo_only,
+        history_db_path: args.history_db_path,
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
