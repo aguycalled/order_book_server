@@ -385,6 +385,9 @@ fn main() {
     println!("  {} fills, {} replica blocks in {:.1}s", n_fills, n_replica, replay_time.as_secs_f64());
     let needs_api_fix = state_a.positions_needing_leverage_fix.len();
     println!("  {} positions need leverage fix from API", needs_api_fix);
+    if !state_a.mark_prices.is_empty() {
+        println!("  {} mark prices indexed from replica_cmds", state_a.mark_prices.len());
+    }
     println!();
 
     // Step 4: If --api-leverage, do two-pass: query API, re-parse, re-replay
@@ -983,6 +986,9 @@ fn print_state_summary(label: &str, state: &LiquidationState) {
     }
     if !state.portfolio_margin_users.is_empty() {
         println!("    {} portfolio margin users", state.portfolio_margin_users.len());
+    }
+    if !state.mark_prices.is_empty() {
+        println!("    {} mark prices indexed", state.mark_prices.len());
     }
 }
 

@@ -229,9 +229,6 @@ async fn handle_socket(
             biased;
             // Snapshot channel: L2/trigger (low frequency) — PRIORITIZED
             recv_result = snapshot_rx.recv() => {
-                static RECV_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let rl = RECV_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if rl < 20 { log::info!("snapshot_rx.recv #{rl}: is_ok={}", recv_result.is_ok()); }
                 match recv_result {
                     Ok(msg) => match msg.as_ref() {
                         SnapshotMessage::Snapshot{ l2_snapshots, trigger_snapshots, time } => {
@@ -546,20 +543,18 @@ async fn send_ws_data_from_snapshot(
             if let Some(snapshot) =
                 snapshot.and_then(|snapshot| snapshot.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
             {
-                let n = n_levels.unwrap_or(250).min(250);
+                let n = n_levels.unwrap_or(400).min(400);
                 let current = snapshot.truncate(n).export_inner_snapshot();
                 let key = format!("{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0));
 
                 let levels_to_send = if let Some(prev) = last_l2_levels.get(&key) {
-                    // Delta mode: compute diff
                     let bid_delta = compute_level_delta(&prev[0], &current[0]);
                     let ask_delta = compute_level_delta(&prev[1], &current[1]);
                     if bid_delta.is_empty() && ask_delta.is_empty() {
-                        return; // No changes
+                        return;
                     }
                     [bid_delta, ask_delta]
                 } else {
-                    // First send: full snapshot
                     current.clone()
                 };
 
@@ -664,7 +659,7 @@ async fn send_ws_data_from_trigger_book(
             let bid_delta = compute_level_delta(&prev[0], &current[0]);
             let ask_delta = compute_level_delta(&prev[1], &current[1]);
             if bid_delta.is_empty() && ask_delta.is_empty() {
-                return; // No changes
+                return;
             }
             [bid_delta, ask_delta]
         } else {

@@ -349,6 +349,7 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         borrow_lend_states,
         portfolio_margin_users,
         vault_states,
+        mark_prices: HashMap::new(),
     })
 }
 

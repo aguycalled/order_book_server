@@ -182,7 +182,11 @@ pub enum Action {
     ClaimRewards(serde_json::Value),
     #[serde(alias = "spotUser")]
     SpotUser(serde_json::Value),
-    SetGlobalAction(serde_json::Value),
+    #[serde(alias = "SetGlobalAction")]
+    SetGlobalAction {
+        #[serde(default)]
+        pxs: Vec<serde_json::Value>,
+    },
     #[serde(rename_all = "camelCase")]
     VoteEthFinalizedWithdrawalAction {
         user: String,
@@ -266,6 +270,7 @@ impl Action {
                 | Action::CDeposit { .. }
                 | Action::CWithdraw { .. }
                 | Action::TokenDelegate { .. }
+                | Action::SetGlobalAction { .. }
         )
     }
 }
@@ -514,8 +519,56 @@ pub fn apply_replica_block(
                     state.apply_spot_transfer(user, 150, *wei);
                     affected_users.insert(user.clone());
                 }
+                Action::SetGlobalAction { pxs } => {
+                    // Update mark prices for dex 0 assets.
+                    // pxs is array of [mark_px, oracle_px] per asset index.
+                    for (asset_idx, px_pair) in pxs.iter().enumerate() {
+                        if let Some(arr) = px_pair.as_array() {
+                            if let Some(mark_str) = arr.first().and_then(|v| v.as_str()) {
+                                if let Ok(mark_px) = mark_str.parse::<f64>() {
+                                    state.mark_prices.insert((0, asset_idx as u32), mark_px);
+                                }
+                            }
+                        }
+                    }
+                }
                 // tokenDelegate changes which validator staked tokens go to, no balance effect.
                 _ => {}
+            }
+        }
+    }
+
+    // Also check for perpDeploy setOracle in responses (hip-3 oracle prices)
+    for (bundle_idx, (_tx_hash, bundle)) in block.abci_block.signed_action_bundles.iter().enumerate() {
+        let bundle_resps = resp_bundles.get(bundle_idx).copied();
+        for (action_idx, signed_action) in bundle.signed_actions.iter().enumerate() {
+            if let Action::PerpDeploy(ref val) = signed_action.action {
+                if let Some(set_oracle) = val.get("setOracle") {
+                    if let Some(dex_name) = set_oracle.get("dex").and_then(|v| v.as_str()) {
+                        if let Some(oracle_pxs) = set_oracle.get("oraclePxs").and_then(|v| v.as_array()) {
+                            // Find the dex index for this dex name
+                            let dex_idx = state.dex_states.iter().position(|d| {
+                                d.universe.first().map(|a| a.name.starts_with(&format!("{dex_name}:"))).unwrap_or(false)
+                            });
+                            if let Some(di) = dex_idx {
+                                for pair in oracle_pxs {
+                                    if let Some(arr) = pair.as_array() {
+                                        if arr.len() >= 2 {
+                                            let coin = arr[0].as_str().unwrap_or("");
+                                            let px_str = arr[1].as_str().unwrap_or("");
+                                            if let Ok(px) = px_str.parse::<f64>() {
+                                                // Find asset index by coin name
+                                                if let Some(ai) = state.dex_states[di].universe.iter().position(|a| a.name == coin) {
+                                                    state.mark_prices.insert((di, ai as u32), px);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

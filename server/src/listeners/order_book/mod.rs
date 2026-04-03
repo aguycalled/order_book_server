@@ -231,10 +231,11 @@ impl OrderBookListener {
         }
 
         if let Some(state) = self.order_book_state.as_mut() {
-            // Skip events at or before the snapshot height — the snapshot already
-            // reflects the state at that height. Processing old events would
-            // incorrectly remove trigger orders that were loaded from the snapshot.
-            if height <= state.height() {
+            // Skip events at or before the initial snapshot height
+            // (only during initial catch-up, not after)
+            static INITIAL_HEIGHT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let snap_height = *INITIAL_HEIGHT.get_or_init(|| state.height());
+            if height <= snap_height {
                 return Ok(());
             }
             state.record_block_progress(height, block_time, line.len() as u64);

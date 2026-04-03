@@ -153,6 +153,9 @@ pub struct LiquidationState {
     pub portfolio_margin_users: std::collections::HashSet<String>,
     /// Vault state: vault_addr → per-user ownership fractions.
     pub vault_states: HashMap<String, VaultState>,
+    /// Per-asset mark prices (in USD string format) from SetGlobalAction.
+    /// Key = (dex_idx, asset_idx), value = mark_price as f64 in USD.
+    pub mark_prices: HashMap<(usize, u32), f64>,
 }
 
 /// Per-vault ownership data parsed from locus.vlt.
