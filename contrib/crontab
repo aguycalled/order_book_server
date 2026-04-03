@@ -1,0 +1,5 @@
+# m h  dom mon dow   command
+0 */6 * * * /home/alex/bin/update_hl_peers.sh >> /home/alex/logs/update_hl_peers_$(date +\%F).log 2>&1
+0 * * * * /home/alex/bin/prune.sh >> /home/alex/logs/prune_$(date +\%F).log 2>&1
+@reboot ./target/release/orderbook_server     --snapshot-mode direct --data-dir /home/alex/hl/data --abci-state-path /home/alex/hl/hyperliquid_data/abci_state.rmp --hlnode-binary /home/alex/hl-node
+@reboot cargo run --release --bin hl_api_proxy --     --address 0.0.0.0     --port 3003     --official-api-base https://api.hyperliquid.xyz     --official-ws-url wss://api.hyperliquid.xyz/ws     --local-ws-url ws://127.0.0.1:8000/ws     --local-api-base http://127.0.0.1:3001

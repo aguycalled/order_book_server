@@ -1,4 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+pub mod clearing_house;
 pub mod history;
 mod listeners;
 pub mod metrics;

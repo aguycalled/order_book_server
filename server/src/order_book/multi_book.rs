@@ -1,7 +1,9 @@
 use crate::{
     order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
     prelude::*,
+    types::L4Order,
 };
+use alloy::primitives::Address;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -52,6 +54,11 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
     }
 
+    pub(crate) fn insert_resting(&mut self, order: O) {
+        let coin = &order.coin();
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).insert_resting(order);
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
         if let Some(book) = self.order_books.get_mut(&coin) {
             let success = book.cancel_order(oid.clone());
@@ -91,6 +98,34 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
+/// Flatten an `(Address, L4Order)` pair into the order itself plus any trigger children.
+fn flatten_with_children(pair: (Address, L4Order)) -> Vec<(Address, L4Order)> {
+    let (addr, mut order) = pair;
+    let children = std::mem::take(&mut order.children);
+    let coin = order.coin.clone();
+    let mut result = vec![(addr, order)];
+    for child_val in children {
+        match serde_json::from_value::<L4Order>(child_val) {
+            Ok(mut child) => {
+                if child.is_trigger && coin.starts_with("xyz:") {
+                    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let c = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c < 10 {
+                        log::info!("HIP3 trigger child: coin={} side={:?} is_trigger={} order_type={} trigger_px={} limit_px={} sz={}",
+                            child.coin, child.side, child.is_trigger, child.order_type, child.trigger_px, child.limit_px, child.sz);
+                    }
+                }
+                child.user = Some(addr);
+                result.push((addr, child));
+            }
+            Err(e) => {
+                log::warn!("Failed to deserialize trigger child: {e}");
+            }
+        }
+    }
+    result
+}
+
 /// Load snapshots from CLI-generated JSON (without height prefix)
 /// Height is read separately from visor_abci_state.json
 pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
@@ -115,15 +150,37 @@ where
     ))
 }
 
-/// Load snapshots from CLI-generated JSON file + height from visor state
-pub(crate) async fn load_snapshots_from_cli_json<O, R>(
+/// Like `load_snapshots_from_cli_str` but also extracts trigger orders from children.
+pub(crate) fn load_snapshots_with_children(str: &str, height: u64) -> Result<(u64, Snapshots<crate::types::inner::InnerL4Order>)> {
+    #[allow(clippy::type_complexity)]
+    let snapshot: Vec<(String, [Vec<(Address, L4Order)>; 2])> = serde_json::from_str(str)?;
+    Ok((
+        height,
+        Snapshots::new(
+            snapshot
+                .into_iter()
+                .map(|(coin, [bids, asks])| {
+                    let bids = bids.into_iter()
+                        .flat_map(flatten_with_children)
+                        .map(crate::types::inner::InnerL4Order::try_from)
+                        .collect::<Result<Vec<_>>>()?;
+                    let asks = asks.into_iter()
+                        .flat_map(flatten_with_children)
+                        .map(crate::types::inner::InnerL4Order::try_from)
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok((Coin::new(&coin), Snapshot([bids, asks])))
+                })
+                .collect::<Result<HashMap<Coin, Snapshot<crate::types::inner::InnerL4Order>>>>()?,
+        ),
+    ))
+}
+
+/// Load snapshots from CLI-generated JSON file + height from visor state.
+/// Extracts trigger orders from children arrays.
+pub(crate) async fn load_snapshots_from_cli_json(
     snapshot_path: &Path,
     visor_state_path: &Path,
-) -> Result<(u64, Snapshots<O>)>
-where
-    O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
-{
+) -> Result<(u64, Snapshots<crate::types::inner::InnerL4Order>)> {
     // Read height from visor_abci_state.json
     let visor_state = read_to_string(visor_state_path).await?;
     let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
@@ -131,7 +188,7 @@ where
 
     // Read snapshot
     let file_contents = read_to_string(snapshot_path).await?;
-    load_snapshots_from_cli_str(&file_contents, height)
+    load_snapshots_with_children(&file_contents, height)
 }
 
 #[cfg(test)]

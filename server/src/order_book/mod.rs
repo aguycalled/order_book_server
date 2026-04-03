@@ -85,6 +85,19 @@ impl<O: InnerOrder> OrderBook<O> {
         }
     }
 
+    /// Insert an order directly into the resting book without matching.
+    /// Used for trigger orders that should sit in the book without interacting with the order flow.
+    pub(crate) fn insert_resting(&mut self, order: O) {
+        if order.sz().is_positive() {
+            let resting_book = match order.side() {
+                Side::Ask => &mut self.asks,
+                Side::Bid => &mut self.bids,
+            };
+            self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
+            add_order_to_book(resting_book, order);
+        }
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
         if let Some((side, px)) = self.oid_to_side_px.remove(&oid) {
             let map = match side {
@@ -128,22 +141,31 @@ impl<O: InnerOrder> OrderBook<O> {
 
     /// Get best bid and best ask in O(1) without computing full L2 snapshot.
     /// Returns (best_bid, best_ask) where each is (price, total_size, order_count).
+    /// Excludes trigger orders which sit at extreme prices and would corrupt the BBO.
     #[must_use]
     pub(crate) fn get_bbo(&self) -> (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>) {
-        // Best bid = highest price in bids (last key in BTreeMap)
-        let best_bid = self.bids.last_key_value().map(|(px, list)| {
+        // Best bid = highest price in bids with non-trigger orders
+        let best_bid = self.bids.iter().rev().find_map(|(px, list)| {
             let orders = list.to_vec();
-            let total_sz = orders.iter().map(|o| o.sz().value()).sum::<u64>();
-            let count = orders.len() as u32;
-            (*px, Sz::new(total_sz), count)
+            let non_trigger: Vec<_> = orders.iter().filter(|o| !o.is_trigger()).collect();
+            if non_trigger.is_empty() {
+                return None;
+            }
+            let total_sz = non_trigger.iter().map(|o| o.sz().value()).sum::<u64>();
+            let count = non_trigger.len() as u32;
+            Some((*px, Sz::new(total_sz), count))
         });
 
-        // Best ask = lowest price in asks (first key in BTreeMap)
-        let best_ask = self.asks.first_key_value().map(|(px, list)| {
+        // Best ask = lowest price in asks with non-trigger orders
+        let best_ask = self.asks.iter().find_map(|(px, list)| {
             let orders = list.to_vec();
-            let total_sz = orders.iter().map(|o| o.sz().value()).sum::<u64>();
-            let count = orders.len() as u32;
-            (*px, Sz::new(total_sz), count)
+            let non_trigger: Vec<_> = orders.iter().filter(|o| !o.is_trigger()).collect();
+            if non_trigger.is_empty() {
+                return None;
+            }
+            let total_sz = non_trigger.iter().map(|o| o.sz().value()).sum::<u64>();
+            let count = non_trigger.len() as u32;
+            Some((*px, Sz::new(total_sz), count))
         });
 
         (best_bid, best_ask)
@@ -157,16 +179,23 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 
     #[must_use]
-    pub(crate) fn from_snapshot(mut snapshot: Snapshot<O>, ignore_triggers: bool) -> Self {
+    pub(crate) fn from_snapshot(snapshot: Snapshot<O>, _ignore_triggers: bool) -> Self {
         let mut book = Self::new();
-        if ignore_triggers {
-            snapshot.remove_triggers();
-        }
+        let mut triggers = Vec::new();
+        // First pass: add all non-trigger orders (matching engine runs)
         snapshot.0.into_iter().for_each(|orders| {
             for order in orders {
-                book.add_order(order);
+                if order.is_trigger() {
+                    triggers.push(order);
+                } else {
+                    book.add_order(order);
+                }
             }
         });
+        // Second pass: insert triggers without matching
+        for order in triggers {
+            book.insert_resting(order);
+        }
         book
     }
 }
@@ -262,6 +291,10 @@ mod tests {
 
         fn modify_sz(&mut self, sz: Sz) {
             self.sz = sz.value();
+        }
+
+        fn is_trigger(&self) -> bool {
+            false
         }
 
         fn convert_trigger(&mut self, _: u64) {}

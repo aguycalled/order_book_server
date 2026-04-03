@@ -83,10 +83,22 @@ lazy_static! {
         "Current orderbook block height"
     ).expect("metric can be created");
 
+    /// Latest block height observed from the streamed node data
+    pub static ref ORDERBOOK_LATEST_DATA_HEIGHT: IntGauge = IntGauge::new(
+        "orderbook_latest_data_height",
+        "Latest block height observed from the streamed node data"
+    ).expect("metric can be created");
+
     /// Orderbook timestamp in milliseconds
     pub static ref ORDERBOOK_TIME_MS: IntGauge = IntGauge::new(
         "orderbook_time_ms",
         "Orderbook timestamp in milliseconds"
+    ).expect("metric can be created");
+
+    /// Approximate size in bytes of the latest processed block across streamed batches
+    pub static ref ORDERBOOK_BLOCK_SIZE_BYTES: IntGauge = IntGauge::new(
+        "orderbook_block_size_bytes",
+        "Approximate size in bytes of the latest processed block across streamed batches"
     ).expect("metric can be created");
 
     /// Pending order statuses in HFT cache
@@ -202,7 +214,9 @@ pub fn register_metrics() {
 
     // Health metrics
     REGISTRY.register(Box::new(ORDERBOOK_HEIGHT.clone())).ok();
+    REGISTRY.register(Box::new(ORDERBOOK_LATEST_DATA_HEIGHT.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_TIME_MS.clone())).ok();
+    REGISTRY.register(Box::new(ORDERBOOK_BLOCK_SIZE_BYTES.clone())).ok();
     REGISTRY.register(Box::new(PENDING_ORDERS_CACHE.clone())).ok();
     REGISTRY.register(Box::new(PENDING_DIFFS_CACHE.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_LAG.clone())).ok();

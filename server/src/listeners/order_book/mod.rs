@@ -2,8 +2,9 @@ use crate::{
     listeners::order_book::state::OrderBookState,
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, ORDERBOOK_COINS_COUNT, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL,
-        ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, ORDERBOOK_BLOCK_SIZE_BYTES, ORDERBOOK_COINS_COUNT,
+        ORDERBOOK_HEIGHT, ORDERBOOK_LATEST_DATA_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
+        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
     },
     order_book::{
         Coin, Px, Snapshot, Sz,
@@ -11,12 +12,10 @@ use crate::{
     },
     prelude::*,
     types::{
-        L4Order,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
-use alloy::primitives::Address;
 use log::{error, info};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -58,7 +57,7 @@ fn fetch_snapshot(
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
                 let snapshot =
-                    load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
+                    load_snapshots_from_cli_json(&output_fln, &visor_path).await;
                 info!("Snapshot fetched");
                 // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
@@ -90,19 +89,26 @@ pub(crate) struct OrderBookListener {
     order_book_state: Option<OrderBookState>,
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
-    internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    snapshot_tx: Option<Sender<Arc<SnapshotMessage>>>,
+    hft_tx: Option<Sender<Arc<HftMessage>>>,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
+    // Trigger snapshots are expensive — recompute less frequently and cache
+    last_trigger_broadcast: Option<Instant>,
+    cached_trigger_snapshots: Arc<TriggerSnapshots>,
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(snapshot_tx: Option<Sender<Arc<SnapshotMessage>>>, hft_tx: Option<Sender<Arc<HftMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
             order_book_state: None,
             fetched_snapshot_cache: None,
-            internal_message_tx,
+            snapshot_tx,
+            hft_tx,
             last_l2_broadcast: None,
+            last_trigger_broadcast: None,
+            cached_trigger_snapshots: Arc::new(HashMap::new()),
         }
     }
 
@@ -167,15 +173,18 @@ impl OrderBookListener {
         let res = match event_source {
             EventSource::Fills => sonic_rs::from_str::<Batch<NodeDataFill>>(&line).map(|batch| {
                 let height = batch.block_number();
-                (height, EventBatch::Fills(batch))
+                let time = batch.block_time();
+                (height, time, EventBatch::Fills(batch))
             }),
-            EventSource::OrderStatuses => sonic_rs::from_str(&line)
-                .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-            EventSource::OrderDiffs => sonic_rs::from_str(&line)
-                .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
+            EventSource::OrderStatuses => sonic_rs::from_str(&line).map(|batch: Batch<NodeDataOrderStatus>| {
+                (batch.block_number(), batch.block_time(), EventBatch::Orders(batch))
+            }),
+            EventSource::OrderDiffs => sonic_rs::from_str(&line).map(|batch: Batch<NodeDataOrderDiff>| {
+                (batch.block_number(), batch.block_time(), EventBatch::BookDiffs(batch))
+            }),
         };
 
-        let (height, event_batch) = match res {
+        let (height, block_time, event_batch) = match res {
             Ok(data) => data,
             Err(err) => {
                 // Log ALL parse errors for debugging
@@ -216,17 +225,32 @@ impl OrderBookListener {
             info!("{event_source} block: {height}");
         }
 
+        let height_i64 = height.min(i64::MAX as u64) as i64;
+        if height_i64 > ORDERBOOK_LATEST_DATA_HEIGHT.get() {
+            ORDERBOOK_LATEST_DATA_HEIGHT.set(height_i64);
+        }
+
+        if let Some(state) = self.order_book_state.as_mut() {
+            // Skip events at or before the snapshot height — the snapshot already
+            // reflects the state at that height. Processing old events would
+            // incorrectly remove trigger orders that were loaded from the snapshot.
+            if height <= state.height() {
+                return Ok(());
+            }
+            state.record_block_progress(height, block_time, line.len() as u64);
+        }
+
         // HFT mode: Process events DIRECTLY without block-level synchronization
         // This is arbor's key insight - process independently with order-level caching
         let changed_coins: HashSet<Coin> = if let Some(state) = self.order_book_state.as_mut() {
             let result = match event_batch {
                 EventBatch::Orders(batch) => {
                     // Broadcast L4 order statuses for L4Book subscribers
-                    if let Some(tx) = &self.internal_message_tx {
+                    if let Some(tx) = &self.hft_tx {
                         let tx = tx.clone();
                         let batch_clone = batch.clone();
                         tokio::spawn(async move {
-                            let msg = Arc::new(InternalMessage::L4OrderStatuses { batch: batch_clone });
+                            let msg = Arc::new(HftMessage::L4OrderStatuses { batch: batch_clone });
                             drop(tx.send(msg));
                         });
                     }
@@ -237,11 +261,11 @@ impl OrderBookListener {
                 }
                 EventBatch::BookDiffs(batch) => {
                     // Broadcast L4 order diffs for L4Book subscribers
-                    if let Some(tx) = &self.internal_message_tx {
+                    if let Some(tx) = &self.hft_tx {
                         let tx = tx.clone();
                         let batch_clone = batch.clone();
                         tokio::spawn(async move {
-                            let msg = Arc::new(InternalMessage::L4OrderDiffs { batch: batch_clone });
+                            let msg = Arc::new(HftMessage::L4OrderDiffs { batch: batch_clone });
                             drop(tx.send(msg));
                         });
                     }
@@ -255,11 +279,10 @@ impl OrderBookListener {
                     EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
 
                     // Broadcast fills immediately
-                    if let Some(tx) = &self.internal_message_tx {
+                    if let Some(tx) = &self.hft_tx {
                         let tx = tx.clone();
                         tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            drop(tx.send(snapshot));
+                            drop(tx.send(Arc::new(HftMessage::Fills { batch })));
                         });
                     }
                     Ok(HashSet::new())
@@ -278,14 +301,18 @@ impl OrderBookListener {
         };
         EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
 
+        if let Some(state) = &self.order_book_state {
+            ORDERBOOK_HEIGHT.set(state.height() as i64);
+            ORDERBOOK_TIME_MS.set(state.time() as i64);
+            ORDERBOOK_BLOCK_SIZE_BYTES.set(state.block_size_bytes() as i64);
+        }
+
         // Log HFT state progress periodically
         static HFT_STATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sc = HFT_STATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if sc % 1000 == 0 {
             if let Some(state) = &mut self.order_book_state {
                 // Record health metrics
-                ORDERBOOK_HEIGHT.set(state.height() as i64);
-                ORDERBOOK_TIME_MS.set(state.time() as i64);
                 PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
                 PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
 
@@ -312,8 +339,7 @@ impl OrderBookListener {
             if let Some(state) = &self.order_book_state {
                 let bbo_start = Instant::now();
                 let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
-                if let Some(tx) = &self.internal_message_tx {
-                    // Count fast BBO broadcasts
+                if let Some(tx) = &self.hft_tx {
                     static BBO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let bc = BBO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if bc % 1000 == 0 {
@@ -322,8 +348,7 @@ impl OrderBookListener {
 
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
-                        drop(tx.send(msg));
+                        drop(tx.send(Arc::new(HftMessage::BboUpdate { bbos, time })));
                     });
                 }
                 BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
@@ -339,10 +364,20 @@ impl OrderBookListener {
             if let Some(state) = &self.order_book_state {
                 let l2_start = Instant::now();
                 let (time, l2_snapshots) = state.l2_snapshots_uncached();
-                if let Some(tx) = &self.internal_message_tx {
+
+                // Recompute trigger snapshots less frequently (every 500ms)
+                let should_recompute_triggers =
+                    self.last_trigger_broadcast.map(|t| t.elapsed() >= Duration::from_millis(500)).unwrap_or(true);
+                if should_recompute_triggers {
+                    let (_, trigger_snapshots) = state.trigger_book_snapshots();
+                    self.cached_trigger_snapshots = Arc::new(trigger_snapshots);
+                    self.last_trigger_broadcast = Some(Instant::now());
+                }
+                let trigger_snapshots = self.cached_trigger_snapshots.clone();
+
+                if let Some(tx) = &self.snapshot_tx {
                     self.last_l2_broadcast = Some(Instant::now());
 
-                    // Count L2 broadcasts
                     static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if bc % 100 == 0 {
@@ -351,8 +386,7 @@ impl OrderBookListener {
 
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots, time });
-                        drop(tx.send(msg));
+                        drop(tx.send(Arc::new(SnapshotMessage::Snapshot { l2_snapshots, trigger_snapshots, time })));
                     });
                 }
                 L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
@@ -363,6 +397,8 @@ impl OrderBookListener {
 }
 
 pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
+
+pub(crate) type TriggerSnapshots = HashMap<Coin, Snapshot<InnerLevel>>;
 
 impl L2Snapshots {
     pub(crate) const fn as_ref(&self) -> &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>> {
@@ -376,25 +412,27 @@ pub(crate) struct TimedSnapshots {
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
 
-// Messages sent from node data listener to websocket dispatch to support streaming
-pub(crate) enum InternalMessage {
+/// Snapshot-based messages (L2/trigger/BBO) — low frequency (~10-100/sec)
+pub(crate) enum SnapshotMessage {
     Snapshot {
         l2_snapshots: L2Snapshots,
+        trigger_snapshots: Arc<TriggerSnapshots>,
+        time: u64,
+    },
+}
+
+/// HFT streaming messages (L4/fills/BBO/orderUpdates) — high frequency (~1000+/sec)
+pub(crate) enum HftMessage {
+    BboUpdate {
+        bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
         time: u64,
     },
     Fills {
         batch: Batch<NodeDataFill>,
     },
-    /// Fast BBO-only broadcast path - bypasses expensive L2 snapshot computation
-    BboUpdate {
-        bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
-        time: u64,
-    },
-    /// HFT L4 streaming - order diffs without waiting for status pairing
     L4OrderDiffs {
         batch: Batch<NodeDataOrderDiff>,
     },
-    /// HFT L4 streaming - order statuses without waiting for diff pairing
     L4OrderStatuses {
         batch: Batch<NodeDataOrderStatus>,
     },
@@ -417,7 +455,10 @@ pub(crate) struct L2SnapshotParams {
 /// 2. Processes OrderDiffs immediately (doesn't wait for OrderStatuses)
 /// 3. Uses process time instead of block time for lowest latency
 pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
-    let dir = config.data_dir.clone().unwrap_or_else(|| dirs::home_dir().expect("Could not find home directory"));
+    let dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| dirs::home_dir().expect("Could not find home directory").join("hl/data"));
 
     info!("Starting HFT-optimized listener");
     info!("Data directory: {:?}", dir);

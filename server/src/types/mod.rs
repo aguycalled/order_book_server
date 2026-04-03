@@ -63,6 +63,15 @@ pub(crate) enum L4Book {
     Updates(L4BookUpdates),
 }
 
+/// Aggregated trigger order book (stop losses / take profits)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TriggerBook {
+    pub coin: String,
+    pub time: u64,
+    pub levels: [Vec<Level>; 2], // [bids, asks] — bucketed by trigger_px or limit_px
+}
+
 /// Best Bid/Offer - top of book only
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Bbo {
@@ -128,14 +137,7 @@ impl L2Book {
         let rebucketed = snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
         let levels = rebucketed.export_inner_snapshot();
 
-        Self {
-            coin: self.coin.clone(),
-            time: self.time,
-            n_sig_figs,
-            mantissa,
-            n_levels: None,
-            levels,
-        }
+        Self { coin: self.coin.clone(), time: self.time, n_sig_figs, mantissa, n_levels: None, levels }
     }
 }
 
@@ -156,7 +158,7 @@ impl Trade {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct L4BookUpdates {
     pub time: u64,
     pub height: u64,

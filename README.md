@@ -15,6 +15,18 @@ Real-time orderbook data from a local Hyperliquid node:
 - **trades** - Real-time trade feed
 - **l4Book** - Full Level 4 orderbook with individual order details
 - **orderUpdates** - User-specific order status stream
+- **triggerBook** - Aggregated trigger order book (stop market / take profit market)
+
+## Changes in this fork
+
+The changes add historical L2 storage and query support:
+
+- Added a new RocksDB-backed history module that records full-market L2 snapshots.
+- Added `--history-db-path` CLI flag (optional). Default database path is `<data-dir>/l2_history.rocksdb`.
+- Added automatic L2 snapshot recording task in the server (first run after startup warmup, then every 15 minutes).
+- Added HTTP endpoint `GET /history/l2` to query stored L2 snapshots by coin and time range.
+- Added L2 re-bucketing support for history queries via `nSigFigs`/`mantissa` style parameters (`n_sig_figs`, `mantissa` in query string).
+- Added `rocksdb` dependency and updated lockfile.
 
 ## Quick Start
 
@@ -48,6 +60,29 @@ cargo build --release
     --hlnode-binary /path/to/hl-node \
     --data-dir /path/to/volumes/hl/data
 ```
+
+## Hyperliquid API Proxy
+
+The workspace also includes `hl_api_proxy`, a small compatibility proxy for clients that expect the official Hyperliquid API surface:
+
+- `POST /exchange` is forwarded to the official Hyperliquid API
+- `POST /info` is forwarded to your local node only for selected `type` values such as `meta`, `clearinghouseState`, `openOrders`, `exchangeStatus`, `userRole`, and `perpDexs`
+- all other HTTP requests are forwarded to the official Hyperliquid API
+- `GET /ws` routes supported local subscriptions (`bbo`, `l2Book`, `l4Book`, `trades`, `orderUpdates`, `triggerBook`) to your local orderbook websocket server and forwards other websocket traffic to the official Hyperliquid websocket
+
+Example:
+
+```bash
+cargo run --release --bin hl_api_proxy -- \
+    --address 0.0.0.0 \
+    --port 3003 \
+    --official-api-base https://api.hyperliquid.xyz \
+    --official-ws-url wss://api.hyperliquid.xyz/ws \
+    --local-ws-url ws://127.0.0.1:8000/ws \
+    --local-api-base http://127.0.0.1:3001
+```
+
+Point your client at `http://127.0.0.1:3003` for HTTP and `ws://127.0.0.1:3003/ws` for websocket traffic.
 
 ## Configuration
 
@@ -91,7 +126,7 @@ After the initial snapshot, the server stays up to date by watching the node's `
 | `--snapshot-mode` | `docker` | `docker` or `direct` |
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
-| `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
+| `--data-dir` | `~/hl/data` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
 | `--abci-state-path` | auto | Path to `abci_state.rmp`. Auto-detected at `<data-dir>/hl/hyperliquid_data/abci_state.rmp` in direct mode. Override if your node stores state in a non-standard location |
 | `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json`. Override if `/tmp` is not writable or you want snapshots stored elsewhere |
 | `--visor-state-path` | auto | Path to `visor_abci_state.json`, which contains the current block height. Auto-detected relative to `--data-dir`. Override if your visor state is in a non-standard location |
@@ -111,6 +146,7 @@ After the initial snapshot, the server stays up to date by watching the node's `
 |------|---------|-------------|
 | `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
 | `--bbo-only` | `false` | Lightweight BBO-only mode (~100MB RAM instead of ~2-3GB). Disables L2/L4/Trades subscriptions |
+| `--history-db-path` | auto | Optional path to RocksDB used for persisted L2 history. Defaults to `<data-dir>/l2_history.rocksdb` |
 
 ## Recommended Configurations
 
@@ -179,6 +215,19 @@ Optional parameters: `nSigFigs` (2-5), `nLevels` (max 100, default 20), `mantiss
 { "method": "subscribe", "subscription": { "type": "l4Book", "coin": "BTC" } }
 ```
 > **Warning:** The initial L4 snapshot contains every individual order in the book and can be **very large** (several MB for liquid coins like BTC/ETH). Some WebSocket clients (e.g., Postman) may not handle payloads of this size. Use a capable client like `wscat` or `websocat`, or connect programmatically. After the initial snapshot, subsequent updates are incremental and lightweight.
+
+### Subscribe to Trigger Book
+Aggregated trigger order book showing open stop market and take profit market orders:
+```json
+{ "method": "subscribe", "subscription": { "type": "triggerBook", "coin": "BTC", "nSigFigs": 5, "nLevels": 20 } }
+```
+Optional parameters: `nSigFigs` (2-5), `nLevels` (max 100, default 20)
+
+Response:
+```json
+{ "channel": "triggerBook", "data": { "coin": "BTC", "time": 1702530000000, "levels": [[{"px": "66720", "sz": "0.00222", "n": 1}], [{"px": "67912", "sz": "0.00224", "n": 1}]] } }
+```
+Levels are `[bids, asks]` — bids are trigger orders below market (stop losses for longs), asks are above (stop losses for shorts). Only market trigger orders (Stop Market, Take Profit Market) are included; limit triggers are excluded. Updates are deduplicated by hash.
 
 ### Subscribe to Order Updates (User-Specific)
 Stream raw order status data for a specific user address:
@@ -262,6 +311,7 @@ The Hyperliquid node must run with **all** of these flags enabled:
 |------|----------|
 | BBO | Only sends when bid/ask px/sz changes |
 | L2Book | Only sends when snapshot hash changes |
+| TriggerBook | Only sends when snapshot hash changes |
 | Trades | Only sends on fills |
 
 ### Latency
@@ -288,7 +338,7 @@ curl http://localhost:9090/metrics
 |----------|--------|-------------|
 | **Connections** | `ws_connections_active` | Current WebSocket connections |
 | | `ws_connections_total` | Total connections since startup |
-| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/l2Book/l4Book/trades/orderUpdates) |
+| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/l2Book/l4Book/trades/orderUpdates/triggerBook) |
 | | `broadcast_receivers` | Number of broadcast channel receivers |
 | **Throughput** | `events_processed_total{type}` | Events by type (orders/diffs/fills) |
 | | `broadcasts_total{channel}` | Broadcasts by channel (bbo/l2/l4/trades) |
@@ -338,6 +388,24 @@ Response:
 | `height` | Current block height |
 | `connections` | Active WebSocket connections |
 
+## L2 History API
+
+The latest uncommitted changes add a historical L2 endpoint on the same HTTP server:
+
+```bash
+curl "http://localhost:8000/history/l2?coin=BTC&start=1702530000000&end=1702533600000"
+```
+
+Query parameters:
+
+- `coin` (required): market symbol (for example `BTC` or `@107`)
+- `start` (required): start timestamp in milliseconds (inclusive)
+- `end` (required): end timestamp in milliseconds (inclusive)
+- `n_sig_figs` (optional): requested rebucket precision (typically `2`-`5`)
+- `mantissa` (optional): optional mantissa for rebucketing
+
+Response is a JSON array of `l2Book` snapshots ordered by time ascending.
+
 ## Deployment
 
 ### Systemd Service
@@ -358,9 +426,59 @@ systemctl start orderbook-server
 journalctl -u orderbook-server -f
 ```
 
+## Clearing House Tools
+
+The workspace includes tools for parsing Hyperliquid ABCI state snapshots, replaying blockchain state, and debugging user positions. These are used to build and verify the liquidation levels engine.
+
+### replay_verify
+
+Validates clearing house state replay accuracy. Parses an RMP snapshot, replays fills + replica_cmds + misc_events until the next snapshot, then compares against ground truth.
+
+```bash
+# Basic: use last two snapshots
+cargo run --release --bin replay_verify
+
+# Specify start block
+cargo run --release --bin replay_verify -- --from-block 934650000
+
+# Debug a user (trace all state changes)
+cargo run --release --bin replay_verify -- --debug-users 0xabc...
+
+# Two-pass: query HL API to fix leverage for new positions, then re-replay
+cargo run --release --bin replay_verify -- --api-leverage
+```
+
+**Data sources:** `periodic_abci_states/` (RMP snapshots), `node_fills_streaming/`, `replica_cmds/`, `misc_events_streaming/`
+
+**Output** (in `~/replay_analysis/<from>_<to>/`): `results.txt`, `diagnostics.txt`, `debug_users.txt`, RMP copies, JSON translations.
+
+### rmp_inspect
+
+Fast user lookup in an RMP snapshot. Prints positions, leverage, balances, and spot collateral across all dexes.
+
+```bash
+cargo run --release --bin rmp_inspect -- <rmp_file> <address> [address...]
+```
+
+### user_trace
+
+Forensic trace of everything that happened to a user between two blocks. Combines snapshot state with fills, replica actions, and misc events, sorted chronologically.
+
+```bash
+cargo run --release --bin user_trace -- \
+  --user 0xabc... --from-block 934650000 --to-block 934660000
+```
+
+### Node flags for clearing house tools
+
+These tools require additional node flags beyond the orderbook server:
+
+- `--write-misc-events` — funding, liquidations, vault operations, rewards
+- `--write-system-and-core-writer-actions` — system-level bridge and spot transfers
+
 ## Caveats
 
-- **No untriggered orders** - Only shows orders on the book
+- **Trigger book is market-only** - Only stop market and take profit market orders appear in `triggerBook`; limit trigger orders are excluded
 - **Snapshot sync time** - Initial snapshot takes ~10-30 seconds
 
 ## Differences from the Hyperliquid Public Release
@@ -388,6 +506,7 @@ This fork spawns **3 dedicated inotify threads** (one per event source) with ind
 | Trades | Yes | Yes |
 | **BBO** | No | Yes - dedicated top-of-book feed with per-coin deduplication |
 | **orderUpdates** | No | Yes - per-user order status stream (filter by address) |
+| **triggerBook** | No | Yes - aggregated stop market / TP market trigger levels |
 
 ### Deduplication
 
@@ -443,6 +562,7 @@ Both use `yawc` with `permessage-deflate`. This fork increases the broadcast cha
 | File watchers | 1 thread | 3 parallel threads |
 | BBO subscription | No | Yes + dedup |
 | Order updates | No | Yes (per-user) |
+| Trigger book | No | Yes (stop/TP market) |
 | BBO-only mode | No | Yes (~100MB) |
 | Metrics | None | 25+ Prometheus metrics |
 | Health endpoint | No | Yes |

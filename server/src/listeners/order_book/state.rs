@@ -17,6 +17,7 @@ pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
     height: u64,
     time: u64,
+    current_block_size_bytes: u64,
     ignore_spot: bool,
     // Persistent cache of OrderStatuses waiting for their New diffs
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible)
@@ -38,6 +39,7 @@ impl OrderBookState {
             ignore_spot,
             time,
             height,
+            current_block_size_bytes: 0,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: HashMap::new(),
             pending_new_diffs: HashMap::new(),
@@ -52,6 +54,21 @@ impl OrderBookState {
         self.time
     }
 
+    pub(super) const fn block_size_bytes(&self) -> u64 {
+        self.current_block_size_bytes
+    }
+
+    pub(super) fn record_block_progress(&mut self, height: u64, time: u64, batch_size_bytes: u64) {
+        if height > self.height {
+            self.height = height;
+            self.time = time;
+            self.current_block_size_bytes = batch_size_bytes;
+        } else if height == self.height {
+            self.time = time;
+            self.current_block_size_bytes = self.current_block_size_bytes.saturating_add(batch_size_bytes);
+        }
+    }
+
     // forcibly take snapshot - (time, height, snapshot)
     pub(super) fn compute_snapshot(&self) -> TimedSnapshots {
         TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
@@ -61,6 +78,20 @@ impl OrderBookState {
     // Used for real-time streaming updates to L2/BBO subscribers
     pub(super) fn l2_snapshots_uncached(&self) -> (u64, L2Snapshots) {
         (self.time, compute_l2_snapshots(&self.order_book))
+    }
+
+    /// Build trigger order book snapshots for all coins.
+    /// Returns raw snapshots (no nsigfigs applied — done per subscriber).
+    pub(super) fn trigger_book_snapshots(&self) -> (u64, super::TriggerSnapshots) {
+        let mut result = HashMap::new();
+        for (coin, book) in self.order_book.as_ref().iter() {
+            let snapshot = book.to_trigger_snapshot(None, None);
+            let [bids, asks] = snapshot.as_ref();
+            if !bids.is_empty() || !asks.is_empty() {
+                result.insert(coin.clone(), snapshot);
+            }
+        }
+        (self.time, result)
     }
 
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
@@ -134,31 +165,43 @@ impl OrderBookState {
     /// Uses bidirectional caching - if diff already arrived, add order immediately
     /// Returns the set of coins that were modified (for selective BBO broadcast)
     pub(super) fn apply_order_statuses_hft(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<HashSet<Coin>> {
-        let height = batch.block_number();
-        let time = batch.block_time();
         let mut changed_coins = HashSet::new();
-
-        // Update height/time to track progress (>= ensures time updates even at same height)
-        if height >= self.height {
-            self.height = height;
-            self.time = time;
-        }
 
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
+
+            // Remove trigger order from book when status changes away from open
+            if order_status.order.is_trigger && order_status.status != "open" {
+                let coin = Coin::new(&order_status.order.coin);
+                if self.order_book.cancel_order(oid.clone(), coin.clone()) {
+                    changed_coins.insert(coin);
+                }
+            }
 
             // Check if there's a pending New diff for this order
             if let Some(sz) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
                 let order_coin = Coin::new(&order_status.order.coin);
+                let is_open_trigger = order_status.order.is_trigger && order_status.status == "open";
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(sz);
-                #[allow(clippy::unwrap_used)]
-                inner_order.convert_trigger(time.try_into().unwrap());
+                if !is_open_trigger {
+                    #[allow(clippy::unwrap_used)]
+                    inner_order.convert_trigger(time.try_into().unwrap());
+                }
                 self.order_book.add_order(inner_order);
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
+            } else if order_status.order.is_trigger && order_status.status == "open"
+                && (order_status.order.order_type.contains("market") || order_status.order.order_type.contains("Market"))
+            {
+                // Open market trigger orders (stop market, TP market) don't get New diffs.
+                // Insert directly without matching — these should sit passively in the book.
+                let order_coin = Coin::new(&order_status.order.coin);
+                let inner_order: InnerL4Order = order_status.try_into()?;
+                self.order_book.insert_resting(inner_order);
+                changed_coins.insert(order_coin);
             } else if order_status.is_inserted_into_book() {
                 // Diff hasn't arrived yet - cache the OrderStatus
                 self.pending_order_statuses.insert(oid, order_status);
@@ -171,15 +214,7 @@ impl OrderBookState {
     /// Uses bidirectional caching - if status already arrived, add order immediately
     /// Returns the set of coins that were modified (for selective BBO broadcast)
     pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
-        let height = batch.block_number();
-        let time = batch.block_time();
         let mut changed_coins = HashSet::new();
-
-        // Update height/time to track progress (>= ensures time updates even at same height)
-        if height >= self.height {
-            self.height = height;
-            self.time = time;
-        }
 
         for diff in batch.events() {
             let oid = diff.oid();
@@ -195,10 +230,13 @@ impl OrderBookState {
                         // Both arrived - add order immediately!
                         let time = order.time.and_utc().timestamp_millis();
                         let order_coin = Coin::new(&order.order.coin);
+                        let is_open_trigger = order.order.is_trigger && order.status == "open";
                         let mut inner_order: InnerL4Order = order.try_into()?;
                         inner_order.modify_sz(sz);
-                        #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
+                        if !is_open_trigger {
+                            #[allow(clippy::unwrap_used)]
+                            inner_order.convert_trigger(time.try_into().unwrap());
+                        }
                         self.order_book.add_order(inner_order);
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
@@ -218,5 +256,34 @@ impl OrderBookState {
             }
         }
         Ok(changed_coins)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OrderBookState;
+    use crate::{order_book::multi_book::Snapshots, types::inner::InnerL4Order};
+    use std::collections::HashMap;
+
+    #[test]
+    fn block_size_accumulates_within_height_and_resets_on_new_height() {
+        let mut state =
+            OrderBookState::from_snapshot(Snapshots::<InnerL4Order>::new(HashMap::new()), 100, 1_000, true, false);
+
+        state.record_block_progress(100, 1_100, 120);
+        state.record_block_progress(100, 1_200, 80);
+        assert_eq!(state.height(), 100);
+        assert_eq!(state.time(), 1_200);
+        assert_eq!(state.block_size_bytes(), 200);
+
+        state.record_block_progress(101, 1_300, 64);
+        assert_eq!(state.height(), 101);
+        assert_eq!(state.time(), 1_300);
+        assert_eq!(state.block_size_bytes(), 64);
+
+        state.record_block_progress(100, 1_400, 999);
+        assert_eq!(state.height(), 101);
+        assert_eq!(state.time(), 1_300);
+        assert_eq!(state.block_size_bytes(), 64);
     }
 }

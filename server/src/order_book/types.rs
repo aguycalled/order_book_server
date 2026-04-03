@@ -62,6 +62,7 @@ pub(crate) trait InnerOrder: Clone {
     fn side(&self) -> Side;
     fn limit_px(&self) -> Px;
     fn sz(&self) -> Sz;
+    fn is_trigger(&self) -> bool;
     fn decrement_sz(&mut self, dec: Sz);
     fn fill(&mut self, maker_order: &mut Self) -> Sz;
     fn modify_sz(&mut self, sz: Sz);

@@ -47,6 +47,10 @@ impl InnerOrder for InnerL4Order {
         self.sz
     }
 
+    fn is_trigger(&self) -> bool {
+        self.is_trigger
+    }
+
     fn decrement_sz(&mut self, dec: Sz) {
         self.sz.decrement_sz(dec.value());
     }

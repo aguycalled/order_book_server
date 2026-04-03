@@ -1,6 +1,9 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+// Shared workspace dep used by replay_verify binary
+use dirs as _;
+
 use clap::{Parser, ValueEnum};
 use server::{Result, ServerConfig, SnapshotMode, run_websocket_server};
 
@@ -37,6 +40,7 @@ struct Args {
     /// Base directory for hlnode data files.
     /// For Docker: the directory containing .hyperliquid_rpc_hlnode_mainnet/
     /// For Direct: the directory containing hl/hyperliquid_data/
+    /// Default: ~/hl/data
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
@@ -85,7 +89,7 @@ struct Args {
     bbo_only: bool,
 
     /// Path to the L2 history RocksDB database.
-    /// Default: <data_dir>/l2_history.rocksdb (or ~/l2_history.rocksdb)
+    /// Default: <data_dir>/l2_history.rocksdb
     #[arg(long)]
     history_db_path: Option<PathBuf>,
 
@@ -115,6 +119,9 @@ async fn start_metrics_server(port: u16) {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    let data_dir =
+        args.data_dir.unwrap_or_else(|| dirs::home_dir().expect("Could not find home directory").join("hl/data"));
+
     // Initialize logger with specified level
     // SAFETY: We're setting this before any threads are spawned
     #[allow(unsafe_code)]
@@ -140,7 +147,7 @@ async fn main() -> Result<()> {
     let config = ServerConfig {
         address: full_address.clone(),
         compression_level: args.compression_level,
-        data_dir: args.data_dir,
+        data_dir: Some(data_dir),
         include_perps,
         include_spot,
         include_hip3,

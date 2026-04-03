@@ -1,12 +1,12 @@
 use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
 use crate::types::node_data::NodeDataOrderStatus;
-use crate::types::{Bbo, L2Book, L4Book, Trade};
+use crate::types::{Bbo, L2Book, L4Book, Trade, TriggerBook};
 use alloy::primitives::Address;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-const MAX_LEVELS: usize = 100;
+const MAX_LEVELS: usize = 250;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,11 +27,15 @@ pub(crate) enum Subscription {
     #[serde(rename_all = "camelCase")]
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
-    L4Book { coin: String },
+    L4Book { coin: String, start_px: Option<String>, end_px: Option<String> },
+    #[serde(rename_all = "camelCase")]
+    L4TriggerBook { coin: String, start_px: Option<String>, end_px: Option<String> },
     #[serde(rename_all = "camelCase")]
     Bbo { coin: String },
     #[serde(rename_all = "camelCase")]
     OrderUpdates { user: String },
+    #[serde(rename_all = "camelCase")]
+    TriggerBook { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize> },
 }
 
 impl Subscription {
@@ -69,12 +73,47 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
-            Self::L4Book { coin } | Self::Bbo { coin } => {
+            Self::L4Book { coin, start_px, end_px } | Self::L4TriggerBook { coin, start_px, end_px } => {
+                if !universe.contains(coin) {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                if let (Some(s), Some(e)) = (start_px, end_px) {
+                    match (s.parse::<f64>(), e.parse::<f64>()) {
+                        (Ok(sv), Ok(ev)) if sv <= ev => {}
+                        _ => {
+                            info!("Invalid subscription: startPx/endPx must be valid numbers with startPx <= endPx");
+                            return false;
+                        }
+                    }
+                }
+                info!("Valid subscription");
+                true
+            }
+            Self::Bbo { coin } => {
                 if !universe.contains(coin) {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }
                 info!("Valid subscription");
+                true
+            }
+            Self::TriggerBook { coin, n_sig_figs, n_levels } => {
+                if !universe.contains(coin) {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
+                if n_levels > MAX_LEVELS {
+                    info!("Invalid subscription: n_levels too high");
+                    return false;
+                }
+                if let Some(n) = *n_sig_figs {
+                    if !(2..=5).contains(&n) {
+                        info!("Invalid subscription: sig figs must be 2-5");
+                        return false;
+                    }
+                }
                 true
             }
             Self::OrderUpdates { user } => {
@@ -100,8 +139,10 @@ impl Subscription {
             Self::Bbo { .. } => "bbo",
             Self::L2Book { .. } => "l2Book",
             Self::L4Book { .. } => "l4Book",
+            Self::L4TriggerBook { .. } => "l4TriggerBook",
             Self::Trades { .. } => "trades",
             Self::OrderUpdates { .. } => "orderUpdates",
+            Self::TriggerBook { .. } => "triggerBook",
         }
     }
 }
@@ -129,9 +170,11 @@ pub(crate) enum ServerResponse {
     SubscriptionResponse(ClientMessage),
     L2Book(L2Book),
     L4Book(L4Book),
+    L4TriggerBook(L4Book),
     Trades(Vec<Trade>),
     Bbo(Bbo),
     OrderUpdates(Vec<OrderUpdate>),
+    TriggerBook(TriggerBook),
     Pong,
     Error(String),
 }

@@ -17,6 +17,66 @@ fn bucket(px: Px, side: Side, n_sig_figs: Option<u32>, mantissa: Option<u64>) ->
     })
 }
 
+impl OrderBook<crate::types::inner::InnerL4Order> {
+    /// Build aggregated trigger order book levels.
+    /// Market trigger orders are bucketed by trigger_px; limit triggers by limit_px.
+    #[must_use]
+    pub(crate) fn to_trigger_snapshot(
+        &self,
+        n_levels: Option<usize>,
+        n_sig_figs: Option<u32>,
+    ) -> Snapshot<InnerLevel> {
+        let bid_levels = map_trigger_levels(&self.bids, Side::Bid, n_levels, n_sig_figs);
+        let ask_levels = map_trigger_levels(&self.asks, Side::Ask, n_levels, n_sig_figs);
+        Snapshot([bid_levels, ask_levels])
+    }
+}
+
+#[must_use]
+fn map_trigger_levels(
+    orders: &BTreeMap<Px, LinkedList<Oid, crate::types::inner::InnerL4Order>>,
+    side: Side,
+    n_levels: Option<usize>,
+    n_sig_figs: Option<u32>,
+) -> Vec<InnerLevel> {
+    use std::collections::BTreeMap as BTreeMapLocal;
+    // Collect trigger orders aggregated by their effective price
+    let mut aggregated: BTreeMapLocal<Px, (Sz, usize)> = BTreeMapLocal::new();
+    for (_px, order_list) in orders {
+        // Collect trigger orders (fold is Fn, not FnMut, so aggregate after)
+        let trigger_orders: Vec<(Px, Sz)> = order_list.fold(Vec::new(), |acc, order| {
+            if order.is_trigger {
+                let effective_px = if order.trigger_px != "0.0" && !order.trigger_px.is_empty() {
+                    if order.order_type.contains("market") || order.order_type.contains("Market")
+                        || order.tif.is_none()
+                    {
+                        Px::parse_from_str(&order.trigger_px).unwrap_or(order.limit_px)
+                    } else {
+                        order.limit_px
+                    }
+                } else {
+                    order.limit_px
+                };
+                acc.push((effective_px, order.sz));
+            }
+        });
+        for (effective_px, sz) in trigger_orders {
+            let bucketed = bucket(effective_px, side, n_sig_figs, None);
+            let entry = aggregated.entry(bucketed).or_insert((Sz::new(0), 0));
+            entry.0 = entry.0 + sz;
+            entry.1 += 1;
+        }
+    }
+    // Return all aggregated trigger levels sorted: bids descending, asks ascending.
+    // Trigger orders can span both sides of mid — no directional truncation here.
+    let iter: Box<dyn Iterator<Item = (&Px, &(Sz, usize))>> = match side {
+        Side::Bid => Box::new(aggregated.iter().rev()),
+        Side::Ask => Box::new(aggregated.iter()),
+    };
+    iter.map(|(px, (sz, n))| InnerLevel { px: *px, sz: *sz, n: *n })
+        .collect()
+}
+
 impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
     pub(crate) fn to_l2_snapshot(
@@ -92,9 +152,12 @@ fn map_to_l2_levels<O: InnerOrder>(
         Side::Bid => Box::new(orders.iter().rev()),
     };
     for (px, orders) in order_iter {
-        // could be done a bit more efficiently using caching
-        let sz = orders.fold(Sz::new(0), |sz, order| *sz = *sz + order.sz());
-        let n = orders.fold(0, |n, _| *n += 1);
+        // Sum only non-trigger orders for L2 levels
+        let sz = orders.fold(Sz::new(0), |sz, order| { if !order.is_trigger() { *sz = *sz + order.sz(); } });
+        let n = orders.fold(0, |n, order| { if !order.is_trigger() { *n += 1; } });
+        if n == 0 {
+            continue;
+        }
         if build_l2_level(
             &mut cur_level,
             &mut levels,

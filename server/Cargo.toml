@@ -25,6 +25,8 @@ prometheus = "0.14"
 lazy_static = "1.4"
 sonic-rs = "0.3"
 rocksdb = "0.22"
+rmp = "0.8"
+ureq = { version = "2", features = ["json"] }
 
 [lints]
 workspace = true

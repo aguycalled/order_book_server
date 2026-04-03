@@ -49,14 +49,7 @@ impl L2History {
         for (coin, param_map) in l2_snapshots.as_ref() {
             if let Some(snapshot) = param_map.get(&params) {
                 let levels = snapshot.clone().export_inner_snapshot();
-                let l2_book = L2Book::from_l2_snapshot(
-                    coin.value(),
-                    levels,
-                    time,
-                    Some(5),
-                    None,
-                    None,
-                );
+                let l2_book = L2Book::from_l2_snapshot(coin.value(), levels, time, Some(5), None, None);
                 let key = make_key(&coin.value(), time);
                 match serde_json::to_vec(&l2_book) {
                     Ok(value) => {
@@ -94,10 +87,7 @@ impl L2History {
         let mut results = Vec::new();
         let prefix = make_prefix(coin);
 
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            &start_key,
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
 
         for item in iter {
             match item {
@@ -161,13 +151,7 @@ pub async fn history_handler(
     Query(params): Query<HistoryQuery>,
     State(history): State<Arc<L2History>>,
 ) -> impl IntoResponse {
-    let results = history.query(
-        &params.coin,
-        params.start,
-        params.end,
-        params.n_sig_figs,
-        params.mantissa,
-    );
+    let results = history.query(&params.coin, params.start, params.end, params.n_sig_figs, params.mantissa);
 
     axum::response::Json(results)
 }

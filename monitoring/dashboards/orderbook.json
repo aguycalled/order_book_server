@@ -942,9 +942,14 @@
                     "expr": "rate(orderbook_height[1m]) * 60",
                     "legendFormat": "Blocks/min",
                     "refId": "A"
+                },
+                {
+                    "expr": "orderbook_block_size_bytes / 1024",
+                    "legendFormat": "Block Size KiB",
+                    "refId": "B"
                 }
             ],
-            "title": "\ud83d\udd22 Block Processing Rate",
+            "title": "\ud83d\udd22 Block Processing Rate / Size",
             "type": "timeseries"
         },
         {
