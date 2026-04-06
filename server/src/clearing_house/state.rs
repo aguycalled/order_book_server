@@ -196,7 +196,7 @@ impl LiquidationState {
 
             // 2) Open new direction: deposit margin for the remaining fill size
             let open_sz = fill_sz - start_position.abs();
-            let margin_px = mark_px.unwrap_or(fill_px).max(fill_px);
+            let margin_px = fill_px;
             let open_notional = (open_sz * margin_px * 1e6).round() as i64;
             let leverage_val = user_state.leverage_settings.get(&(asset_idx as u32))
                 .map(|l| match l {
@@ -269,7 +269,7 @@ impl LiquidationState {
 
                 if leverage_val > 0 {
                     // Protocol uses mark price for margin, not fill price
-                    let margin_px = mark_px.unwrap_or(fill_px).max(fill_px);
+                    let margin_px = fill_px;
                     let margin_notional = (fill_sz * margin_px * 1e6).round() as i64;
                     let margin_transfer = margin_notional / leverage_val as i64;
                     if debug {
@@ -472,7 +472,7 @@ impl LiquidationState {
                 *raw_usd += delta_u;
                 if is_adding && lev > 0 {
                     // Adding: margin deposit from cross to isolated (uses mark price)
-                    let margin_px = mark_px.unwrap_or(fill_px).max(fill_px);
+                    let margin_px = fill_px;
                     let margin_notional = (fill_sz * margin_px * 1e6).round() as i64;
                     let margin_transfer = margin_notional / lev as i64;
                     *raw_usd += margin_transfer;
