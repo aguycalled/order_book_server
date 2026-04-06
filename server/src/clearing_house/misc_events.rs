@@ -378,14 +378,22 @@ fn apply_ledger_update(state: &mut LiquidationState, ledger: &LedgerUpdateEvent)
             let amount_str = v.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
 
             let is_bridge = sender == "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24";
-            let is_perps_dst = dst.is_empty() || matches!(dst, "xyz" | "flx" | "vntl" | "hyna" | "km" | "abcd" | "cash");
 
-            if is_bridge && src == "spot" && is_perps_dst && !dest.is_empty() {
+            if is_bridge && src == "spot" && !dest.is_empty() {
+                // Bridge deposits go to spot wallet (SCL). The user may then
+                // sendAsset from spot to perps, which is handled separately in replica_cmds.
                 let amt: f64 = amount_str.parse().unwrap_or(0.0);
                 if amt > 0.0 {
-                    let micro = (amt * 1e6).round() as i64;
                     let dest_addr = dest.to_lowercase();
-                    state.apply_usd_transfer(&dest_addr, micro);
+                    let token_name = v.get("token").and_then(|v| v.as_str()).unwrap_or("USDC");
+                    let token_id: u32 = match token_name {
+                        "USDC" => 0,
+                        "USDH" => 360,
+                        "USDE" => 235,
+                        _ => 0,
+                    };
+                    let delta = (amt * 1e8).round() as i64;
+                    state.apply_spot_transfer(&dest_addr, token_id, delta);
                     return true;
                 }
             }

@@ -171,11 +171,18 @@ pub enum Action {
     #[serde(alias = "perpDeploy")]
     PerpDeploy(serde_json::Value),
     #[serde(alias = "agentEnableDexAbstraction")]
-    AgentEnableDexAbstraction(serde_json::Value),
+    AgentEnableDexAbstraction {},
+    #[serde(rename_all = "camelCase")]
     #[serde(alias = "userDexAbstraction")]
-    UserDexAbstraction(serde_json::Value),
+    UserDexAbstraction {
+        #[serde(default)]
+        abstraction: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
     #[serde(alias = "agentSetAbstraction")]
-    AgentSetAbstraction(serde_json::Value),
+    AgentSetAbstraction {
+        abstraction: String,
+    },
     #[serde(alias = "voteAppHash")]
     VoteAppHash(serde_json::Value),
     #[serde(alias = "claimRewards")]
@@ -271,6 +278,9 @@ impl Action {
                 | Action::CWithdraw { .. }
                 | Action::TokenDelegate { .. }
                 | Action::SetGlobalAction { .. }
+                | Action::AgentSetAbstraction { .. }
+                | Action::AgentEnableDexAbstraction { .. }
+                | Action::UserDexAbstraction { .. }
         )
     }
 }
@@ -468,6 +478,22 @@ pub fn apply_replica_block(
                     let target = target_user.to_lowercase();
                     state.apply_set_abstraction(&target, abstraction);
                     affected_users.insert(target);
+                }
+                Action::AgentSetAbstraction { abstraction } => {
+                    let Some(user) = &user else { continue };
+                    state.apply_set_abstraction(user, abstraction);
+                    affected_users.insert(user.clone());
+                }
+                Action::AgentEnableDexAbstraction {} => {
+                    let Some(user) = &user else { continue };
+                    state.apply_set_abstraction(user, "d");
+                    affected_users.insert(user.clone());
+                }
+                Action::UserDexAbstraction { abstraction } => {
+                    let Some(user) = &user else { continue };
+                    let mode = abstraction.as_deref().unwrap_or("d");
+                    state.apply_set_abstraction(user, mode);
+                    affected_users.insert(user.clone());
                 }
                 Action::VoteEthFinalizedWithdrawalAction { .. } => {
                     // withdraw3 already deducted the balance. This is just validators
