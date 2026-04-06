@@ -287,33 +287,28 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         }
     }
 
-    // Apply account mode and spot collateral to dex user states
+    // Apply account mode and spot collateral to ALL dex user states
     for dex in &mut dex_states {
         let token_id = dex.collateral_token;
         let decimals = 8u32;
         for (addr, user_state) in &mut dex.users {
             user_state.account_mode = account_modes.get(addr).copied().unwrap_or(super::AccountMode::Standard);
             user_state.spot_collateral_decimals = decimals;
-            if user_state.account_mode.is_shared_usdc() {
-                user_state.spot_collateral =
-                    spot_balances.get(addr).and_then(|tokens| tokens.get(&token_id)).copied().unwrap_or(0);
-            }
+            user_state.spot_collateral =
+                spot_balances.get(addr).and_then(|tokens| tokens.get(&token_id)).copied().unwrap_or(0);
         }
-        // Also apply to users without positions
         for (addr, partial) in &mut dex.users_without_positions {
             partial.account_mode = account_modes.get(addr).copied().unwrap_or(super::AccountMode::Standard);
             partial.spot_collateral_decimals = decimals;
-            if partial.account_mode.is_shared_usdc() {
-                partial.spot_collateral =
-                    spot_balances.get(addr).and_then(|tokens| tokens.get(&token_id)).copied().unwrap_or(0);
-            }
+            partial.spot_collateral =
+                spot_balances.get(addr).and_then(|tokens| tokens.get(&token_id)).copied().unwrap_or(0);
         }
     }
 
-    // Build unified_balances from spot_balances for shared-usdc users.
+    // Build unified_balances from spot_balances for all users.
     let mut unified_balances: HashMap<(String, u32), i64> = HashMap::new();
     for (addr, tokens) in &spot_balances {
-        if account_modes.get(addr).map(|m| m.is_shared_usdc()).unwrap_or(false) {
+        {
             for (&token_id, &balance) in tokens {
                 unified_balances.insert((addr.clone(), token_id), balance);
             }

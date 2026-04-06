@@ -439,8 +439,6 @@ pub fn apply_replica_block(
                         if let Some(pdi) = src_pdi {
                             state.apply_usd_transfer_on_dex(&sender, -micro, pdi);
                         } else if is_spot(src) {
-                            // Spot source: deduct from SCL for shared-usdc users
-                            // (both Unified and DexAbs track USDC in SCL)
                             let delta = (amt * 1e8).round() as i64;
                             state.apply_spot_transfer(&sender, token_id, -delta);
                         }
@@ -448,7 +446,6 @@ pub fn apply_replica_block(
                         if let Some(pdi) = dst_pdi {
                             state.apply_usd_transfer_on_dex(&dest, micro, pdi);
                         } else if is_spot(dst) {
-                            // Spot destination: add to SCL for shared-usdc users
                             let delta = (amt * 1e8).round() as i64;
                             state.apply_spot_transfer(&dest, token_id, delta);
                         }

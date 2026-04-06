@@ -782,30 +782,25 @@ impl LiquidationState {
     /// `delta` is in 8-decimal (weiDecimals) units — goes directly to unified_balances.
     pub fn apply_spot_transfer(&mut self, user: &str, token_id: u32, delta: i64) {
         let user_lower = user.to_lowercase();
-        // For shared-usdc users, update spot_collateral on the user state.
+        // Update spot_collateral on every dex that uses this collateral token.
+        // Track spot balances for ALL users, not just shared-usdc.
+        let mut found = false;
         for dex in &mut self.dex_states {
             if dex.collateral_token != token_id {
                 continue;
             }
             if let Some(us) = dex.users.get_mut(&user_lower) {
-                if us.account_mode.is_shared_usdc() {
-                    us.spot_collateral += delta;
-                }
+                us.spot_collateral += delta;
+                found = true;
             }
             if let Some(ps) = dex.users_without_positions.get_mut(&user_lower) {
-                if ps.account_mode.is_shared_usdc() {
-                    ps.spot_collateral += delta;
-                }
+                ps.spot_collateral += delta;
+                found = true;
             }
         }
-        // Also maintain unified_balances map
-        let is_shared = self.dex_states.iter().any(|dex| {
-            dex.collateral_token == token_id && (
-                dex.users.get(&user_lower).map(|u| u.account_mode.is_shared_usdc()).unwrap_or(false) ||
-                dex.users_without_positions.get(&user_lower).map(|p| p.account_mode.is_shared_usdc()).unwrap_or(false)
-            )
-        });
-        if is_shared {
+        // If user not found on any dex with this token, store in unified_balances
+        // as a fallback (handles new users receiving spot transfers)
+        if !found {
             let key = (user_lower, token_id);
             *self.unified_balances.entry(key).or_default() += delta;
         }

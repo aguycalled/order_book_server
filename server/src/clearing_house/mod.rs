@@ -990,51 +990,41 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
 
     // Pre-compute cross-dex totals for shared-usdc users (Unified + DexAbstraction).
     // Key = (user_addr, collateral_token), Value = sum of usdc_balance across all dexes + scl.
+    // Cross-dex total: sum (usdc_balance + spot_collateral) per (user, collateral_token).
+    // spot_collateral is shared across dexes with the same token — count it only once.
+    // Now tracked for ALL users, not just shared-usdc.
     let mut replay_cross_dex: HashMap<(String, u32), i64> = HashMap::new();
     let mut truth_cross_dex: HashMap<(String, u32), i64> = HashMap::new();
 
-    // Track which (user, token) has already had SCL counted to avoid double-counting.
-    // SCL is shared across dexes, so spot_collateral is the same value on each dex
-    // with the same collateral token — count it only once.
-    // SCL is shared across dexes, so spot_collateral is the same value on each dex
-    // with the same collateral token — count it only once.
     let mut replay_scl_counted: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     for dex in &replay.dex_states {
         let token = dex.collateral_token;
         for (addr, user) in &dex.users {
-            if user.account_mode.is_shared_usdc() {
-                let key = (addr.clone(), token);
-                let scl = if replay_scl_counted.insert(key.clone()) { user.spot_collateral / 100 } else { 0 };
-                *replay_cross_dex.entry(key).or_default() += user.usdc_balance + scl;
-            }
+            let key = (addr.clone(), token);
+            let scl = if replay_scl_counted.insert(key.clone()) { user.spot_collateral / 100 } else { 0 };
+            *replay_cross_dex.entry(key).or_default() += user.usdc_balance + scl;
         }
         for (addr, partial) in &dex.users_without_positions {
-            if partial.account_mode.is_shared_usdc() {
-                let key = (addr.clone(), token);
-                let scl = if replay_scl_counted.insert(key.clone()) { partial.spot_collateral / 100 } else { 0 };
-                *replay_cross_dex.entry(key).or_default() += partial.usdc_balance + scl;
-            }
+            let key = (addr.clone(), token);
+            let scl = if replay_scl_counted.insert(key.clone()) { partial.spot_collateral / 100 } else { 0 };
+            *replay_cross_dex.entry(key).or_default() += partial.usdc_balance + scl;
         }
     }
     let mut truth_scl_counted: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     for dex in &truth.dex_states {
         let token = dex.collateral_token;
         for (addr, user) in &dex.users {
-            if user.account_mode.is_shared_usdc() {
-                let key = (addr.clone(), token);
-                let scl = if truth_scl_counted.insert(key.clone()) { user.spot_collateral / 100 } else { 0 };
-                *truth_cross_dex.entry(key).or_default() += user.usdc_balance + scl;
-            }
+            let key = (addr.clone(), token);
+            let scl = if truth_scl_counted.insert(key.clone()) { user.spot_collateral / 100 } else { 0 };
+            *truth_cross_dex.entry(key).or_default() += user.usdc_balance + scl;
         }
         for (addr, partial) in &dex.users_without_positions {
-            if partial.account_mode.is_shared_usdc() {
-                let key = (addr.clone(), token);
-                let scl = if truth_scl_counted.insert(key.clone()) { partial.spot_collateral / 100 } else { 0 };
-                *truth_cross_dex.entry(key).or_default() += partial.usdc_balance + scl;
-            }
+            let key = (addr.clone(), token);
+            let scl = if truth_scl_counted.insert(key.clone()) { partial.spot_collateral / 100 } else { 0 };
+            *truth_cross_dex.entry(key).or_default() += partial.usdc_balance + scl;
         }
     }
-    // Track which shared-usdc users have already been compared (to avoid double-counting)
+    // Track which users have already been compared cross-dex (to avoid double-counting)
     let mut compared_shared_usdc: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
 
     // Per-dex comparison
@@ -1083,41 +1073,23 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
             };
 
             {
-                // For shared-usdc users (Unified + DexAbstraction): compare cross-dex
-                // total equity (sum of usdc + scl across all dexes with same collateral token).
+                // Compare cross-dex total equity (usdc + spot) per collateral token.
                 // Only report once per (user, token) — on the first dex encountered.
-                // For other modes: compare usdc_balance directly per dex.
-                if replay_user.account_mode.is_shared_usdc() {
-                    let token = replay_dex.collateral_token;
-                    let key = (addr.clone(), token);
-                    if !compared_shared_usdc.contains(&key) {
-                        compared_shared_usdc.insert(key.clone());
-                        let replay_total = replay_cross_dex.get(&key).copied().unwrap_or(0);
-                        let truth_total = truth_cross_dex.get(&key).copied().unwrap_or(0);
-                        let diff = replay_total - truth_total;
-                        let diff_usd = diff as f64 / 1e6;
-                        let truth_usd = truth_total as f64 / 1e6;
-                        let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
-                        if diff.abs() > 1_000_000 {
-                            result.balance_drifts.push(BalanceDrift {
-                                user: addr.clone(),
-                                replay_balance: replay_total,
-                                truth_balance: truth_total,
-                                diff_usd,
-                                pct,
-                            });
-                        }
-                    }
-                } else {
-                    let diff = replay_user.usdc_balance - truth_user.usdc_balance;
+                let token = replay_dex.collateral_token;
+                let key = (addr.clone(), token);
+                if !compared_shared_usdc.contains(&key) {
+                    compared_shared_usdc.insert(key.clone());
+                    let replay_total = replay_cross_dex.get(&key).copied().unwrap_or(0);
+                    let truth_total = truth_cross_dex.get(&key).copied().unwrap_or(0);
+                    let diff = replay_total - truth_total;
                     let diff_usd = diff as f64 / 1e6;
-                    let truth_usd = truth_user.usdc_balance as f64 / 1e6;
+                    let truth_usd = truth_total as f64 / 1e6;
                     let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
                     if diff.abs() > 1_000_000 {
                         result.balance_drifts.push(BalanceDrift {
                             user: addr.clone(),
-                            replay_balance: replay_user.usdc_balance,
-                            truth_balance: truth_user.usdc_balance,
+                            replay_balance: replay_total,
+                            truth_balance: truth_total,
                             diff_usd,
                             pct,
                         });
@@ -1200,24 +1172,8 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
                 }
             }
 
-            // Compare spot_collateral — skip for shared-usdc users since it's
-            // already included in the cross-dex total equity comparison above.
-            if !replay_user.account_mode.is_shared_usdc() {
-                if replay_user.spot_collateral != truth_user.spot_collateral {
-                    let diff = (replay_user.spot_collateral - truth_user.spot_collateral) / 100; // 8→6 dec
-                    let diff_usd = diff as f64 / 1e6;
-                    let truth_usd = (truth_user.spot_collateral / 100) as f64 / 1e6;
-                    let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
-                    if diff.abs() > 1_000_000 {
-                        result.scl_drifts.push(BalanceDrift {
-                            user: addr.clone(),
-                            replay_balance: replay_user.spot_collateral / 100,
-                            truth_balance: truth_user.spot_collateral / 100,
-                            diff_usd,
-                            pct,
-                        });
-                    }
-                }
+            // spot_collateral is included in the cross-dex total above — no separate check.
+            {
             }
 
             // Check for extra positions in replay
