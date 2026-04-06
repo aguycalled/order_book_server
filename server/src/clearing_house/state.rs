@@ -21,8 +21,17 @@ impl LiquidationState {
     /// Apply a fill to update a user's position and balance.
     /// Returns the affected coin name if the user was found/created.
     pub(crate) fn apply_fill(&mut self, user: &str, fill: &Fill) -> Option<String> {
+        // Handle spot fills (coin starts with "@")
+        if fill.coin.starts_with('@') {
+            return self.apply_spot_fill(user, fill);
+        }
+
         let &(dex_idx, asset_idx) = self.coin_to_dex_asset.get(&fill.coin)?;
         let collateral_token = self.dex_states[dex_idx].collateral_token;
+        let dex_pdi = self.dex_states[dex_idx].pdi;
+        // Mark price for this asset. The protocol uses mark price (not fill price)
+        // for margin calculations on all dexes.
+        let mark_px = self.mark_prices.get(&(dex_idx, asset_idx as u32)).copied();
         let dex = &mut self.dex_states[dex_idx];
         let meta = &dex.universe[asset_idx];
         let sz_decimals = meta.sz_decimals;
@@ -52,8 +61,14 @@ impl LiquidationState {
 
         let user_lower = user.to_lowercase();
         let debug = self.debug_users.contains(&user_lower);
+        // For Unified users on hip-3 dexes, isolated margin returns go to
+        // spot_collateral (the dex's collateral token) instead of usdc_balance.
+        let unified_hip3 = dex_pdi > 0; // actual check against account_mode done after user_state is resolved
         // When isolated margin can't be sourced from the local dex, defer to dex 0.
         let mut cross_dex_margin_deficit: i64 = 0;
+        // Track SCL changes that need to be propagated to other dexes with the same token.
+        // Stored in 8-decimal units. Applied after the main fill logic.
+        let mut scl_delta_8dec: i64 = 0;
         if debug {
             eprintln!(
                 "[DEBUG fill] user={} coin={} side={:?} sz={} px={} startPos={} fee={} delta_u=${:.2}",
@@ -140,19 +155,32 @@ impl LiquidationState {
 
         if is_flip && is_isolated {
             // Position flip on isolated: close the old position fully, then open new direction.
-            // 1) Close: return raw_usd + close_pnl to usdc
+            // All fees are attributed to the close portion; the open portion has zero fee.
+
+            // 1) Close: return raw_usd + close_pnl to cross balance
             if let Some(pos) = user_state.positions.get(&(asset_idx as u32)) {
                 if let Leverage::Isolated { raw_usd, .. } = pos.leverage {
                     let close_sz = start_position.abs();
-                    let close_delta = (sign * close_sz * fill_px * 1e6 - fee * 1e6 * (close_sz / fill_sz)).round() as i64;
+                    // All fee goes to close portion
+                    let close_delta = (sign * close_sz * fill_px * 1e6 - fee * 1e6).round() as i64;
                     let return_amount = raw_usd + close_delta;
-                    if debug {
-                        eprintln!(
-                            "  → ISOLATED FLIP: close old pos, return raw_usd=${:.2} + close_delta=${:.2} = ${:.2} to usdc",
-                            raw_usd as f64 / 1e6, close_delta as f64 / 1e6, return_amount as f64 / 1e6
-                        );
+                    if user_state.account_mode.is_shared_usdc() {
+                        // Unified/DexAbs: return to spot_collateral (SCL)
+                        let d = return_amount * 100;
+                        user_state.spot_collateral += d;
+                        scl_delta_8dec += d;
+                        if debug {
+                            eprintln!("  → ISOLATED FLIP CLOSE (unified): ${:.2} to scl", return_amount as f64 / 1e6);
+                        }
+                    } else {
+                        user_state.usdc_balance += return_amount;
+                        if debug {
+                            eprintln!(
+                                "  → ISOLATED FLIP: close old pos, return raw_usd=${:.2} + close_delta=${:.2} = ${:.2} to usdc",
+                                raw_usd as f64 / 1e6, close_delta as f64 / 1e6, return_amount as f64 / 1e6
+                            );
+                        }
                     }
-                    user_state.usdc_balance += return_amount;
                 }
             }
             // Save leverage before removing
@@ -168,7 +196,8 @@ impl LiquidationState {
 
             // 2) Open new direction: deposit margin for the remaining fill size
             let open_sz = fill_sz - start_position.abs();
-            let open_notional = (open_sz * fill_px * 1e6).round() as i64;
+            let margin_px = mark_px.unwrap_or(fill_px);
+            let open_notional = (open_sz * margin_px * 1e6).round() as i64;
             let leverage_val = user_state.leverage_settings.get(&(asset_idx as u32))
                 .map(|l| match l {
                     Leverage::Isolated { leverage, .. } => *leverage,
@@ -182,10 +211,16 @@ impl LiquidationState {
                     open_sz, margin_transfer as f64 / 1e6
                 );
             }
-            user_state.usdc_balance -= margin_transfer;
+            if user_state.account_mode.is_shared_usdc() {
+                let d = -(margin_transfer * 100);
+                user_state.spot_collateral += d;
+                scl_delta_8dec += d;
+            } else {
+                user_state.usdc_balance -= margin_transfer;
+            }
 
-            // Compute open delta_u for the new portion
-            let open_delta = (sign * open_sz * fill_px * 1e6 - fee * 1e6 * (open_sz / fill_sz)).round() as i64;
+            // Open delta_u: no fee (all fee was on close portion)
+            let open_delta = (sign * open_sz * fill_px * 1e6).round() as i64;
 
             // Create the new position
             let default_leverage = user_state.leverage_settings.get(&(asset_idx as u32)).cloned()
@@ -207,6 +242,16 @@ impl LiquidationState {
             let is_adding = (start_szi_val >= 0 && is_buy) || (start_szi_val <= 0 && !is_buy) || start_szi_val == 0;
 
             if is_adding {
+                // Compute max leverage for fallback (same logic as position creation below)
+                let max_lev_for_margin = if dex_pdi > 0 {
+                    margin_table_id.min(20)
+                } else {
+                    dex.margin_tables
+                        .get(&margin_table_id)
+                        .and_then(|tiers| tiers.first())
+                        .map(|t| t.max_leverage.min(20))
+                        .unwrap_or(margin_table_id.min(20))
+                };
                 let leverage_val = user_state
                     .positions
                     .get(&(asset_idx as u32))
@@ -220,27 +265,42 @@ impl LiquidationState {
                             Leverage::Cross(l) => *l,
                         })
                     })
-                    .unwrap_or(20);
+                    .unwrap_or(max_lev_for_margin);
 
                 if leverage_val > 0 {
-                    let fill_notional = (fill_sz * fill_px * 1e6).round() as i64;
-                    let margin_transfer = fill_notional / leverage_val as i64;
+                    // Protocol uses mark price for margin, not fill price
+                    let margin_px = mark_px.unwrap_or(fill_px);
+                    let margin_notional = (fill_sz * margin_px * 1e6).round() as i64;
+                    let margin_transfer = margin_notional / leverage_val as i64;
                     if debug {
                         eprintln!(
-                            "  → ISOLATED ADD: notional=${:.2} lev={} margin_deposit=${:.2}",
-                            fill_notional as f64 / 1e6, leverage_val, margin_transfer as f64 / 1e6,
+                            "  → ISOLATED ADD: notional=${:.2} (mark_px={:.4}) lev={} margin_deposit=${:.2}",
+                            margin_notional as f64 / 1e6, margin_px, leverage_val, margin_transfer as f64 / 1e6,
                         );
                     }
                     // Deduct margin from local usdc.
                     // For DexAbstraction/Unified, the protocol sources from spot_collateral
                     // if usdc is insufficient — we don't track scl changes, so only deduct
                     // what's available in usdc and let the rest be a scl change.
-                    if user_state.account_mode.is_shared_usdc() {
-                        // Shared mode: deduct from usdc up to what's available, rest from scl (untracked)
+                    if user_state.account_mode == crate::clearing_house::AccountMode::Unified {
+                        // Unified: margin comes from spot_collateral (scl)
+                        let d = -(margin_transfer * 100);
+                        user_state.spot_collateral += d;
+                        scl_delta_8dec += d;
+                        if debug {
+                            eprintln!("  → margin from scl (Unified): scl now=${:.2}", user_state.spot_collateral as f64 / 1e8);
+                        }
+                    } else if user_state.account_mode.is_shared_usdc() {
+                        // DexAbstraction: deduct from usdc up to what's available, rest from scl
                         let usdc_available = user_state.usdc_balance.max(0);
                         let from_usdc = margin_transfer.min(usdc_available);
                         user_state.usdc_balance -= from_usdc;
-                        // Remainder comes from spot_collateral — not tracked per-dex
+                        let remaining = margin_transfer - from_usdc;
+                        if remaining > 0 {
+                            let d = -(remaining * 100);
+                            user_state.spot_collateral += d;
+                            scl_delta_8dec += d;
+                        }
                     } else if user_state.usdc_balance >= margin_transfer {
                         user_state.usdc_balance -= margin_transfer;
                     } else {
@@ -254,11 +314,31 @@ impl LiquidationState {
                 eprintln!("  → ISOLATED REDUCE: no margin deposit");
             }
         } else {
-            // Cross: delta goes to usdc_balance
-            if debug {
-                eprintln!("  → CROSS: usdc_balance += ${:.2}", delta_u as f64 / 1e6);
+            // Cross: routing depends on account mode and dex.
+            if user_state.account_mode == crate::clearing_house::AccountMode::Unified {
+                // Unified on dex 0: split delta_u between usdc and scl by leverage
+                let lev = user_state.positions.get(&(asset_idx as u32))
+                    .map(|p| match &p.leverage { Leverage::Cross(l) => *l, Leverage::Isolated { leverage, .. } => *leverage })
+                    .or_else(|| user_state.leverage_settings.get(&(asset_idx as u32)).map(|l| match l {
+                        Leverage::Cross(l) => *l, Leverage::Isolated { leverage, .. } => *leverage,
+                    }))
+                    .unwrap_or(20) as i64;
+                let scl_portion = if lev > 0 { delta_u / lev } else { 0 };
+                let usdc_portion = delta_u - scl_portion;
+                if debug {
+                    eprintln!("  → CROSS (Unified dex0): usdc += ${:.2}, scl += ${:.2} (lev={})",
+                        usdc_portion as f64 / 1e6, scl_portion as f64 / 1e6, lev);
+                }
+                user_state.usdc_balance += usdc_portion;
+                let d = scl_portion * 100;
+                user_state.spot_collateral += d; // 6→8 dec
+                scl_delta_8dec += d;
+            } else {
+                if debug {
+                    eprintln!("  → CROSS: usdc_balance += ${:.2}", delta_u as f64 / 1e6);
+                }
+                user_state.usdc_balance += delta_u;
             }
-            user_state.usdc_balance += delta_u;
         }
 
         if debug {
@@ -275,17 +355,30 @@ impl LiquidationState {
         } else if new_szi == 0 {
             // Position fully closed
             if is_isolated {
-                // When closing an isolated position, remaining raw_usd returns to cross balance
+                // When closing an isolated position, remaining raw_usd returns to cross balance.
+                // For Unified on hip-3: returns to spot_collateral (dex's collateral token).
                 if let Some(pos) = user_state.positions.get(&(asset_idx as u32)) {
                     if let Leverage::Isolated { raw_usd, .. } = pos.leverage {
                         let return_amount = raw_usd + delta_u;
-                        if debug {
-                            eprintln!(
-                                "  → ISOLATED CLOSE: raw_usd=${:.2} + delta_u=${:.2} = ${:.2} returned to usdc_balance",
-                                raw_usd as f64 / 1e6, delta_u as f64 / 1e6, return_amount as f64 / 1e6,
-                            );
+                        if user_state.account_mode.is_shared_usdc() {
+                            let d = return_amount * 100;
+                            user_state.spot_collateral += d;
+                            scl_delta_8dec += d;
+                            if debug {
+                                eprintln!(
+                                    "  → ISOLATED CLOSE (unified): ${:.2} returned to scl",
+                                    return_amount as f64 / 1e6,
+                                );
+                            }
+                        } else {
+                            user_state.usdc_balance += return_amount;
+                            if debug {
+                                eprintln!(
+                                    "  → ISOLATED CLOSE: raw_usd=${:.2} + delta_u=${:.2} = ${:.2} returned to usdc_balance",
+                                    raw_usd as f64 / 1e6, delta_u as f64 / 1e6, return_amount as f64 / 1e6,
+                                );
+                            }
                         }
-                        user_state.usdc_balance += return_amount;
                     }
                 }
             }
@@ -349,16 +442,26 @@ impl LiquidationState {
             let fill_notional = (fill_sz * fill_px * 1e6).round() as i64;
             let start_szi_for_cb = (start_position * sz_multiplier).round() as i64;
             let is_adding_for_cb = (start_szi_for_cb >= 0 && is_buy) || (start_szi_for_cb <= 0 && !is_buy) || start_szi_for_cb == 0;
+            // Detect flip: position crosses zero
+            let is_flip_for_cb = start_szi_for_cb != 0 && new_szi != 0
+                && ((start_szi_for_cb > 0 && new_szi < 0) || (start_szi_for_cb < 0 && new_szi > 0));
             if is_new_position || start_szi_for_cb == 0 {
                 pos.cost_basis = fill_notional;
+            } else if is_flip_for_cb {
+                // Flip: new cb is mark-to-market for the new open portion
+                let new_position_abs = new_position.abs();
+                pos.cost_basis = (new_position_abs * fill_px * 1e6).round() as i64;
+                // Funding resets on flip (old position closed, new one opened)
+                pos.outstanding_funding = 0;
             } else if is_adding_for_cb {
                 pos.cost_basis += fill_notional;
             } else {
-                // Reducing: scale proportionally
-                let old_sz = start_position.abs();
-                if old_sz > 0.0 {
-                    let remaining = (old_sz - fill_sz).max(0.0);
-                    pos.cost_basis = (pos.cost_basis as f64 * remaining / old_sz).round() as i64;
+                // Reducing: scale proportionally using integer szi for exact arithmetic.
+                // new_cb = old_cb * remaining_szi / original_szi
+                let original_szi = start_szi_for_cb.unsigned_abs() as i128;
+                let remaining_szi = new_szi.unsigned_abs() as i128;
+                if original_szi > 0 {
+                    pos.cost_basis = ((pos.cost_basis as i128 * remaining_szi) / original_szi) as i64;
                 }
             }
 
@@ -368,9 +471,10 @@ impl LiquidationState {
                 let is_adding = (start_szi_val >= 0 && is_buy) || (start_szi_val <= 0 && !is_buy) || start_szi_val == 0;
                 *raw_usd += delta_u;
                 if is_adding && lev > 0 {
-                    // Adding: margin deposit from cross to isolated
-                    let fill_notional = (fill_sz * fill_px * 1e6).round() as i64;
-                    let margin_transfer = fill_notional / lev as i64;
+                    // Adding: margin deposit from cross to isolated (uses mark price)
+                    let margin_px = mark_px.unwrap_or(fill_px);
+                    let margin_notional = (fill_sz * margin_px * 1e6).round() as i64;
+                    let margin_transfer = margin_notional / lev as i64;
                     *raw_usd += margin_transfer;
                 } else if !is_adding {
                     // Reducing: proportional margin returns from raw_usd to cross balance.
@@ -383,12 +487,24 @@ impl LiquidationState {
                         let margin_return = proportional_raw + delta_u;
                         if margin_return > 0 {
                             *raw_usd -= margin_return;
-                            user_state.usdc_balance += margin_return;
-                            if debug {
-                                eprintln!(
-                                    "  → ISOLATED PARTIAL CLOSE: fraction={:.4} margin_return=${:.2} to usdc",
-                                    fraction, margin_return as f64 / 1e6
-                                );
+                            if user_state.account_mode.is_shared_usdc() {
+                                let d = margin_return * 100;
+                                user_state.spot_collateral += d;
+                                scl_delta_8dec += d;
+                                if debug {
+                                    eprintln!(
+                                        "  → ISOLATED PARTIAL CLOSE (unified): fraction={:.4} margin_return=${:.2} to scl",
+                                        fraction, margin_return as f64 / 1e6
+                                    );
+                                }
+                            } else {
+                                user_state.usdc_balance += margin_return;
+                                if debug {
+                                    eprintln!(
+                                        "  → ISOLATED PARTIAL CLOSE: fraction={:.4} margin_return=${:.2} to usdc",
+                                        fraction, margin_return as f64 / 1e6
+                                    );
+                                }
                             }
                         }
                     }
@@ -400,6 +516,30 @@ impl LiquidationState {
         let oracle_px_raw = (fill_px * 10f64.powi(6 - sz_decimals as i32)).round() as i64;
         if asset_idx < dex.oracle_prices.len() {
             dex.oracle_prices[asset_idx] = oracle_px_raw;
+        }
+
+        // Propagate SCL changes to other dexes with the same collateral token.
+        // This ensures the cross-dex total comparison sees the updated value.
+        if scl_delta_8dec != 0 {
+            for other_dex in &mut self.dex_states {
+                if other_dex.collateral_token != collateral_token {
+                    continue;
+                }
+                // Skip the dex we already updated (by index)
+                if other_dex.pdi == dex_pdi {
+                    continue;
+                }
+                if let Some(us) = other_dex.users.get_mut(&user_lower_for_fix) {
+                    if us.account_mode.is_shared_usdc() {
+                        us.spot_collateral += scl_delta_8dec;
+                    }
+                }
+                if let Some(ps) = other_dex.users_without_positions.get_mut(&user_lower_for_fix) {
+                    if ps.account_mode.is_shared_usdc() {
+                        ps.spot_collateral += scl_delta_8dec;
+                    }
+                }
+            }
         }
 
         // Standard mode only: if isolated margin couldn't be sourced locally, take from dex 0
@@ -582,22 +722,90 @@ impl LiquidationState {
         }
     }
 
+    /// Dex-targeted USD transfer: applies to a specific dex identified by pdi.
+    /// Used by sendAsset with sourceDex/destinationDex to target the correct clearing house.
+    pub fn apply_usd_transfer_on_dex(&mut self, user: &str, delta_micro_usd: i64, target_pdi: u32) {
+        let user_lower = user.to_lowercase();
+        let debug = self.debug_users.contains(&user_lower);
+        for dex in &mut self.dex_states {
+            if dex.pdi != target_pdi {
+                continue;
+            }
+            if let Some(user_state) = dex.users.get_mut(&user_lower) {
+                if debug {
+                    eprintln!(
+                        "[DEBUG usd_transfer_on_dex] user={} pdi={} delta=${:.2} before=${:.2}",
+                        user_lower, target_pdi, delta_micro_usd as f64 / 1e6,
+                        user_state.usdc_balance as f64 / 1e6,
+                    );
+                }
+                user_state.usdc_balance += delta_micro_usd;
+                return;
+            }
+            if let Some(partial) = dex.users_without_positions.get_mut(&user_lower) {
+                if debug {
+                    eprintln!(
+                        "[DEBUG usd_transfer_on_dex] user={} pdi={} delta=${:.2} before=${:.2} (partial)",
+                        user_lower, target_pdi, delta_micro_usd as f64 / 1e6,
+                        partial.usdc_balance as f64 / 1e6,
+                    );
+                }
+                partial.usdc_balance += delta_micro_usd;
+                return;
+            }
+            // User not on this dex — create partial entry
+            if debug {
+                eprintln!(
+                    "[DEBUG usd_transfer_on_dex] user={} pdi={} delta=${:.2} CREATING partial",
+                    user_lower, target_pdi, delta_micro_usd as f64 / 1e6,
+                );
+            }
+            dex.users_without_positions
+                .entry(user_lower)
+                .or_insert_with(|| super::UserStatePartial {
+                    usdc_balance: 0,
+                    spot_collateral: 0,
+                    spot_collateral_decimals: 8,
+                    account_mode: super::AccountMode::Standard,
+                    leverage_settings: std::collections::HashMap::new(),
+                })
+                .usdc_balance += delta_micro_usd;
+            return;
+        }
+        // Target dex not found — fall back to generic transfer
+        self.apply_usd_transfer(user, delta_micro_usd);
+    }
+
     /// Adjust spot collateral for a user.
     /// For users without positions, updates partial state in place.
     /// Adjust spot collateral for a unified user.
     /// `delta` is in 8-decimal (weiDecimals) units — goes directly to unified_balances.
     pub fn apply_spot_transfer(&mut self, user: &str, token_id: u32, delta: i64) {
         let user_lower = user.to_lowercase();
-        // Check if user is unified
-        let is_unified = self.dex_states.iter().any(|dex| {
+        // For shared-usdc users, update spot_collateral on the user state.
+        for dex in &mut self.dex_states {
+            if dex.collateral_token != token_id {
+                continue;
+            }
+            if let Some(us) = dex.users.get_mut(&user_lower) {
+                if us.account_mode.is_shared_usdc() {
+                    us.spot_collateral += delta;
+                }
+            }
+            if let Some(ps) = dex.users_without_positions.get_mut(&user_lower) {
+                if ps.account_mode.is_shared_usdc() {
+                    ps.spot_collateral += delta;
+                }
+            }
+        }
+        // Also maintain unified_balances map
+        let is_shared = self.dex_states.iter().any(|dex| {
             dex.collateral_token == token_id && (
                 dex.users.get(&user_lower).map(|u| u.account_mode.is_shared_usdc()).unwrap_or(false) ||
                 dex.users_without_positions.get(&user_lower).map(|p| p.account_mode.is_shared_usdc()).unwrap_or(false)
             )
         });
-        if is_unified {
-            // delta is already in 8-decimal units, unified_balance_add expects 6-decimal
-            // so divide by 100
+        if is_shared {
             let key = (user_lower, token_id);
             *self.unified_balances.entry(key).or_default() += delta;
         }
@@ -630,6 +838,182 @@ impl LiquidationState {
             }
         }
     }
+
+    /// Process an order status event to track margin hold changes for Unified users.
+    ///
+    /// When a Unified user places a resting order, the protocol moves margin from
+    /// spot_collateral (SCL) to usdc_balance. When the order is canceled, the
+    /// margin returns to SCL. This function replays those sweeps.
+    /// Apply a spot fill to update SCL balances.
+    /// Spot fills have coin = "@N" where N is the spot pair index.
+    /// Buy: user pays quote token (e.g. USDC), receives base token (e.g. USDE).
+    /// Sell: user pays base token, receives quote token.
+    fn apply_spot_fill(&mut self, user: &str, fill: &Fill) -> Option<String> {
+        let user_lower = user.to_lowercase();
+        let debug = self.debug_users.contains(&user_lower);
+
+        let (base_token, quote_token, _sz_dec) = self.spot_pairs.get(&fill.coin)?;
+        let base_token = *base_token;
+        let quote_token = *quote_token;
+
+        let fill_sz: f64 = fill.sz.parse().unwrap_or(0.0);
+        let fill_px: f64 = fill.px.parse().unwrap_or(0.0);
+        let fee: f64 = fill.fee.parse().unwrap_or(0.0);
+
+        if fill_sz == 0.0 || fill_px == 0.0 {
+            return Some(fill.coin.clone());
+        }
+
+        *self.user_action_counts.entry(user_lower.clone()).or_default() += 1;
+
+        let is_buy = fill.side == crate::order_book::types::Side::Bid;
+
+        // Determine which token the fee is in
+        let fee_token_name = fill.fee_token.split(':').next().unwrap_or(&fill.fee_token);
+        let fee_is_base = fee_token_name != "USDC" && fee_token_name != "USDH" && fee_token_name != "USDE";
+
+        // Compute deltas in 8-decimal (weiDecimals) units
+        let base_delta_8dec = (fill_sz * 1e8).round() as i64;
+        let quote_delta_8dec = (fill_sz * fill_px * 1e8).round() as i64;
+        let fee_8dec = (fee * 1e8).round() as i64;
+
+        if is_buy {
+            // Buy: receive base, pay quote, fee from base or quote
+            self.apply_spot_transfer(&user_lower, base_token, base_delta_8dec);
+            self.apply_spot_transfer(&user_lower, quote_token, -quote_delta_8dec);
+            if fee_is_base {
+                self.apply_spot_transfer(&user_lower, base_token, -fee_8dec);
+            } else {
+                self.apply_spot_transfer(&user_lower, quote_token, -fee_8dec);
+            }
+        } else {
+            // Sell: pay base, receive quote
+            self.apply_spot_transfer(&user_lower, base_token, -base_delta_8dec);
+            self.apply_spot_transfer(&user_lower, quote_token, quote_delta_8dec);
+            if fee_is_base {
+                self.apply_spot_transfer(&user_lower, base_token, -fee_8dec);
+            } else {
+                self.apply_spot_transfer(&user_lower, quote_token, -fee_8dec);
+            }
+        }
+
+        if debug {
+            eprintln!(
+                "[DEBUG spot_fill] user={} coin={} {} sz={} px={} fee={} feeToken={} base_tok={} quote_tok={}",
+                user_lower, fill.coin, if is_buy { "BUY" } else { "SELL" },
+                fill_sz, fill_px, fee, fill.fee_token, base_token, quote_token
+            );
+        }
+
+        Some(fill.coin.clone())
+    }
+
+    ///
+    /// The hold amount = notional / leverage. Both "open" and "canceled" events
+    /// carry the order's sz and limit_px, so we compute the hold symmetrically
+    /// without needing to track per-oid state.
+    pub fn apply_order_status(
+        &mut self,
+        user: &str,
+        coin: &str,
+        _side_is_buy: bool,
+        limit_px: f64,
+        sz: f64,
+        oid: u64,
+        is_open: bool, // true = order placed, false = order canceled
+        is_trigger: bool,
+        is_ioc: bool,
+    ) {
+        // Only track resting orders (non-trigger, non-IOC)
+        if is_trigger || is_ioc {
+            return;
+        }
+
+        let user_lower = user.to_lowercase();
+
+        // Only apply to Unified users (they have usdc↔SCL sweeps on order changes)
+        let is_unified = self.dex_states.iter().any(|dex| {
+            dex.users
+                .get(&user_lower)
+                .map(|u| u.account_mode == super::AccountMode::Unified)
+                .unwrap_or(false)
+                || dex
+                    .users_without_positions
+                    .get(&user_lower)
+                    .map(|p| p.account_mode == super::AccountMode::Unified)
+                    .unwrap_or(false)
+        });
+        if !is_unified {
+            return;
+        }
+
+        let Some(&(dex_idx, asset_idx)) = self.coin_to_dex_asset.get(coin) else {
+            return;
+        };
+        let leverage = self.dex_states[dex_idx]
+            .users
+            .get(&user_lower)
+            .and_then(|u| {
+                u.leverage_settings
+                    .get(&(asset_idx as u32))
+                    .or_else(|| u.positions.get(&(asset_idx as u32)).map(|p| &p.leverage))
+            })
+            .or_else(|| {
+                self.dex_states[dex_idx]
+                    .users_without_positions
+                    .get(&user_lower)
+                    .and_then(|p| p.leverage_settings.get(&(asset_idx as u32)))
+            })
+            .map(|l| match l {
+                super::Leverage::Cross(v) => *v,
+                super::Leverage::Isolated { leverage, .. } => *leverage,
+            })
+            .unwrap_or(20) as i64;
+
+        let notional = (sz * limit_px * 1e6).round() as i64;
+        let hold = if leverage > 0 {
+            notional / leverage
+        } else {
+            0
+        };
+
+        if hold == 0 {
+            return;
+        }
+
+        let debug = self.debug_users.contains(&user_lower);
+
+        // Open: margin moves from usdc to SCL (order hold)
+        // Cancel: margin returns from SCL to usdc
+        // NOTE: Currently disabled — need to also account for pre-snapshot orders
+        // and orders that survive until end-snapshot to get the net delta right.
+        return;
+        #[allow(unreachable_code)]
+        let sign: i64 = if is_open { -1 } else { 1 };
+
+        if debug {
+            let action = if is_open { "OPEN" } else { "CANCEL" };
+            eprintln!(
+                "[DEBUG order_status] {} oid={} user={} coin={} sz={} px={} hold=${:.2} lev={}",
+                action, oid, user_lower, coin, sz, limit_px, hold as f64 / 1e6, leverage
+            );
+        }
+
+        *self.user_action_counts.entry(user_lower.clone()).or_default() += 1;
+
+        for dex in &mut self.dex_states {
+            if let Some(us) = dex.users.get_mut(&user_lower) {
+                us.usdc_balance += sign * hold;
+                us.spot_collateral -= sign * hold * 100; // 6→8 dec
+                return;
+            }
+            if let Some(ps) = dex.users_without_positions.get_mut(&user_lower) {
+                ps.usdc_balance += sign * hold;
+                ps.spot_collateral -= sign * hold * 100;
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -640,7 +1024,7 @@ mod tests {
 
     fn make_state(asset_count: usize) -> LiquidationState {
         let universe: Vec<_> = (0..asset_count)
-            .map(|idx| AssetMeta { name: format!("COIN{idx}"), sz_decimals: 0, margin_table_id: 0 })
+            .map(|idx| AssetMeta { name: format!("COIN{idx}"), sz_decimals: 0, margin_table_id: 0, margin_mode: super::MarginMode::Normal })
             .collect();
         let coin_to_dex_asset = universe.iter().enumerate().map(|(idx, meta)| (meta.name.clone(), (0, idx))).collect();
 
@@ -659,6 +1043,15 @@ mod tests {
             debug_users: std::collections::HashSet::new(),
             positions_needing_leverage_fix: Vec::new(),
             event_log: None,
+            unified_balances: HashMap::new(),
+            user_action_counts: HashMap::new(),
+            borrow_lend_states: HashMap::new(),
+            portfolio_margin_users: std::collections::HashSet::new(),
+            vault_states: HashMap::new(),
+            mark_prices: HashMap::new(),
+            order_holds: HashMap::new(),
+            spot_pairs: HashMap::new(),
+            dex_name_to_pdi: HashMap::new(),
         }
     }
 

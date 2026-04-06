@@ -5,7 +5,7 @@ pub mod rmp_streaming;
 pub mod state;
 
 use crate::prelude::*;
-use crate::types::node_data::{Batch, NodeDataFill};
+use crate::types::node_data::{Batch, NodeDataFill, NodeDataOrderStatus};
 use log::{info, warn};
 use std::{
     collections::HashMap,
@@ -156,6 +156,14 @@ pub struct LiquidationState {
     /// Per-asset mark prices (in USD string format) from SetGlobalAction.
     /// Key = (dex_idx, asset_idx), value = mark_price as f64 in USD.
     pub mark_prices: HashMap<(usize, u32), f64>,
+    /// (Reserved for future per-order tracking if needed.)
+    pub order_holds: HashMap<u64, (String, i64)>,
+    /// Spot pair metadata: coin name (e.g. "@150") → (base_token_id, quote_token_id, sz_decimals).
+    /// Used to process spot fills that change SCL balances.
+    pub spot_pairs: HashMap<String, (u32, u32, u32)>,
+    /// Dex name → pdi mapping (e.g. "xyz" → 1, "cash" → 7).
+    /// Populated from coin name prefixes in the snapshot.
+    pub dex_name_to_pdi: HashMap<String, u32>,
 }
 
 /// Per-vault ownership data parsed from locus.vlt.
@@ -570,15 +578,163 @@ pub fn replay_interleaved(
         }
     }
 
+    // // Collect order status events keyed by block number.
+    // // These files are very large (10s of GB), so we only read the specific
+    // // hourly file that covers our block range, using the same directory layout
+    // // as fills (node_order_statuses_streaming/hourly/YYYYMMDD/HH).
+    // let mut order_status_batches: Vec<(u64, String)> = Vec::new();
+    // {
+    //     // Determine which hourly file(s) to read by looking at the fills directory
+    //     // for available date/hour paths, then using the same paths for order statuses.
+    //     // Order statuses live alongside fills. Try multiple base dirs:
+    //     // 1. backed-up data_dir, 2. home_dir/hl/data, 3. real home ~/hl/data
+    //     let candidate_dirs = [
+    //         data_dir.join("node_order_statuses_streaming"),
+    //         home_dir.join("hl/data/node_order_statuses_streaming"),
+    //         dirs::home_dir()
+    //             .unwrap_or_default()
+    //             .join("hl/data/node_order_statuses_streaming"),
+    //     ];
+    //     let os_base_dir = candidate_dirs
+    //         .iter()
+    //         .find(|d| d.exists())
+    //         .cloned();
+
+    //     // Discover the specific hourly file(s) to read by matching fills paths
+    //     let mut os_files = Vec::new();
+    //     if let Some(ref os_base) = os_base_dir {
+    //         // Find which hourly files the fills came from
+    //         let fills_dir = data_dir.join("node_fills_streaming");
+    //         let mut fill_files = Vec::new();
+    //         if fills_dir.exists() {
+    //             collect_files_recursive(&fills_dir, &mut fill_files);
+    //         }
+    //         for fill_path in &fill_files {
+    //             // Extract the relative path after "node_fills_streaming/"
+    //             let fill_str = fill_path.to_string_lossy();
+    //             if let Some(pos) = fill_str.find("node_fills_streaming/") {
+    //                 let rel = &fill_str[pos + "node_fills_streaming/".len()..];
+    //                 let os_path = os_base.join(rel);
+    //                 if os_path.exists() {
+    //                     os_files.push(os_path);
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     for path in &os_files {
+    //         let file = match fs::File::open(path) {
+    //             Ok(f) => f,
+    //             Err(e) => {
+    //                 warn!("Failed to open order_status file {}: {e}", path.display());
+    //                 continue;
+    //             }
+    //         };
+    //         info!("Reading order statuses from {}", path.display());
+    //         let reader = BufReader::new(file);
+    //         for line in reader.lines() {
+    //             let Ok(line) = line else { break };
+    //             let trimmed = line.trim();
+    //             if trimmed.is_empty() {
+    //                 continue;
+    //             }
+    //             // Quick pre-filter: extract block_number with string search
+    //             if let Some(pos) = trimmed.find("\"block_number\":") {
+    //                 let num_start = pos + 15;
+    //                 let num_end = trimmed[num_start..]
+    //                     .find(|c: char| !c.is_ascii_digit())
+    //                     .map(|i| num_start + i)
+    //                     .unwrap_or(trimmed.len());
+    //                 if let Ok(bn) = trimmed[num_start..num_end].parse::<u64>() {
+    //                     if bn <= from_block || bn > to_block {
+    //                         continue;
+    //                     }
+    //                 } else {
+    //                     continue;
+    //                 }
+    //             } else {
+    //                 continue;
+    //             }
+    //             if let Ok(batch) = serde_json::from_str::<Batch<NodeDataOrderStatus>>(trimmed) {
+    //                 let bn = batch.block_number();
+    //                 if bn > from_block && bn <= to_block {
+    //                     order_status_batches.push((bn, line));
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    // info!(
+    //     "Collected {} order status batches",
+    //     order_status_batches.len()
+    // );
+
+    // Collect HIP-3 oracle updates for mark prices
+    let hip3_local = data_dir.join("hip3_oracle_updates_streaming");
+    let hip3_home = home_dir.join("hl/data/hip3_oracle_updates_streaming");
+    let hip3_real = dirs::home_dir().unwrap_or_default().join("hl/data/hip3_oracle_updates_streaming");
+    let hip3_oracle_dir = [hip3_local, hip3_home, hip3_real]
+        .into_iter()
+        .find(|d| d.exists())
+        .unwrap_or_default();
+    let mut hip3_oracle_batches: Vec<(u64, String)> = Vec::new();
+    if hip3_oracle_dir.exists() {
+        // Use same hourly file matching as fills
+        let fills_dir = data_dir.join("node_fills_streaming");
+        let mut fill_files = Vec::new();
+        if fills_dir.exists() {
+            collect_files_recursive(&fills_dir, &mut fill_files);
+        }
+        for fill_path in &fill_files {
+            let fill_str = fill_path.to_string_lossy();
+            if let Some(pos) = fill_str.find("node_fills_streaming/") {
+                let rel = &fill_str[pos + "node_fills_streaming/".len()..];
+                let oracle_path = hip3_oracle_dir.join(rel);
+                if oracle_path.exists() {
+                    let file = match fs::File::open(&oracle_path) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    info!("Reading HIP-3 oracle updates from {}", oracle_path.display());
+                    let reader = BufReader::new(file);
+                    for line in reader.lines() {
+                        let Ok(line) = line else { break };
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() { continue; }
+                        if let Some(pos) = trimmed.find("\"block_number\":") {
+                            let num_start = pos + 15;
+                            let num_end = trimmed[num_start..]
+                                .find(|c: char| !c.is_ascii_digit())
+                                .map(|i| num_start + i)
+                                .unwrap_or(trimmed.len());
+                            if let Ok(bn) = trimmed[num_start..num_end].parse::<u64>() {
+                                if bn > from_block && bn <= to_block {
+                                    hip3_oracle_batches.push((bn, line));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !hip3_oracle_batches.is_empty() {
+        info!("Collected {} HIP-3 oracle batches", hip3_oracle_batches.len());
+    }
+
     // Merge and sort by block number. Order within same block:
+    // 0. HIP-3 oracle updates (mark prices — before everything so margin uses correct price)
     // 1. Replica (leverage changes, transfers)
-    // 2. MiscEvents (funding, liquidations)
-    // 3. Fills (position changes)
+    // 2. OrderStatus (margin hold changes — before fills so holds are set up)
+    // 3. MiscEvents (funding, liquidations)
+    // 4. Fills (position changes)
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
     enum EventType {
-        Replica = 0,
-        MiscEvent = 1,
-        Fill = 2,
+        Hip3Oracle = 0,
+        Replica = 1,
+        OrderStatus = 2,
+        MiscEvent = 3,
+        Fill = 4,
     }
     let mut events: Vec<(u64, EventType, String)> = Vec::new();
     for (bn, line) in fill_batches {
@@ -590,14 +746,76 @@ pub fn replay_interleaved(
     for (bn, line) in misc_batches {
         events.push((bn, EventType::MiscEvent, line));
     }
+    for (bn, line) in hip3_oracle_batches {
+        events.push((bn, EventType::Hip3Oracle, line));
+    }
+    // for (bn, line) in order_status_batches {
+    //     events.push((bn, EventType::OrderStatus, line));
+    // }
     events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     let mut total_fills: u64 = 0;
     let mut total_replica: u64 = 0;
     let mut total_misc: u64 = 0;
+    let mut total_order_statuses: u64 = 0;
+    let mut total_hip3_oracle: u64 = 0;
 
     for (block_num, event_type, line) in &events {
         match event_type {
+            EventType::Hip3Oracle => {
+                // Parse HIP-3 oracle updates to set mark prices.
+                // Format: {"block_number":N, "events":[{"oracle_pxs":{"coin_to_mark_px":[["coin",{"px":"123.45",...}],...]}}]}
+                if let Ok(batch) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(events_arr) = batch.get("events").and_then(|e| e.as_array()) {
+                        for ev in events_arr {
+                            if let Some(pairs) = ev.pointer("/oracle_pxs/coin_to_mark_px").and_then(|v| v.as_array()) {
+                                for pair in pairs {
+                                    if let Some(arr) = pair.as_array() {
+                                        if arr.len() >= 2 {
+                                            let coin = arr[0].as_str().unwrap_or("");
+                                            let px_str = arr[1].get("px").and_then(|p| p.as_str()).unwrap_or("0");
+                                            let px: f64 = px_str.parse().unwrap_or(0.0);
+                                            if px > 0.0 {
+                                                if let Some(&(dex_idx, asset_idx)) = state.coin_to_dex_asset.get(coin) {
+                                                    state.mark_prices.insert((dex_idx, asset_idx as u32), px);
+                                                    total_hip3_oracle += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            EventType::OrderStatus => {
+                if let Ok(batch) = serde_json::from_str::<Batch<NodeDataOrderStatus>>(line) {
+                    for os in batch.events() {
+                        let user_addr = format!("{}", os.user).to_lowercase();
+                        let is_open = os.status == "open";
+                        let is_cancel = os.status == "canceled";
+                        if !is_open && !is_cancel {
+                            continue;
+                        }
+                        let limit_px: f64 = os.order.limit_px.parse().unwrap_or(0.0);
+                        let sz: f64 = os.order.sz.parse().unwrap_or(0.0);
+                        let is_ioc = os.order.tif.as_deref() == Some("Ioc");
+                        state.apply_order_status(
+                            &user_addr,
+                            &os.order.coin,
+                            os.order.side == crate::order_book::types::Side::Bid,
+                            limit_px,
+                            sz,
+                            os.order.oid,
+                            is_open,
+                            os.order.is_trigger,
+                            is_ioc,
+                        );
+                        total_order_statuses += 1;
+                    }
+                }
+            }
             EventType::Fill => {
                 if let Ok(batch) = serde_json::from_str::<Batch<NodeDataFill>>(line) {
                     let bn = batch.block_number();
@@ -679,7 +897,7 @@ pub fn replay_interleaved(
     }
 
     info!(
-        "Interleaved replay: {total_fills} fills, {total_replica} replica blocks, {total_misc} misc events (blocks {from_block}..{to_block})"
+        "Interleaved replay: {total_fills} fills, {total_replica} replica blocks, {total_misc} misc events, {total_order_statuses} order statuses, {total_hip3_oracle} hip3 oracle updates (blocks {from_block}..{to_block})"
     );
     (total_fills, total_replica)
 }
@@ -764,9 +982,60 @@ fn format_leverage(lev: &Leverage) -> String {
 }
 
 /// Compare replayed state against ground truth (parsed second snapshot).
-/// Per-dex, per-field comparison — no cross-dex summing.
+/// Per-dex, per-field comparison. For Unified/DexAbstraction users, balance comparison
+/// sums usdc across all dexes with the same collateral token + SCL, since the protocol
+/// silently rebalances between them.
 pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Vec<ComparisonResult> {
     let mut results = Vec::new();
+
+    // Pre-compute cross-dex totals for shared-usdc users (Unified + DexAbstraction).
+    // Key = (user_addr, collateral_token), Value = sum of usdc_balance across all dexes + scl.
+    let mut replay_cross_dex: HashMap<(String, u32), i64> = HashMap::new();
+    let mut truth_cross_dex: HashMap<(String, u32), i64> = HashMap::new();
+
+    // Track which (user, token) has already had SCL counted to avoid double-counting.
+    // SCL is shared across dexes, so spot_collateral is the same value on each dex
+    // with the same collateral token — count it only once.
+    // SCL is shared across dexes, so spot_collateral is the same value on each dex
+    // with the same collateral token — count it only once.
+    let mut replay_scl_counted: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+    for dex in &replay.dex_states {
+        let token = dex.collateral_token;
+        for (addr, user) in &dex.users {
+            if user.account_mode.is_shared_usdc() {
+                let key = (addr.clone(), token);
+                let scl = if replay_scl_counted.insert(key.clone()) { user.spot_collateral / 100 } else { 0 };
+                *replay_cross_dex.entry(key).or_default() += user.usdc_balance + scl;
+            }
+        }
+        for (addr, partial) in &dex.users_without_positions {
+            if partial.account_mode.is_shared_usdc() {
+                let key = (addr.clone(), token);
+                let scl = if replay_scl_counted.insert(key.clone()) { partial.spot_collateral / 100 } else { 0 };
+                *replay_cross_dex.entry(key).or_default() += partial.usdc_balance + scl;
+            }
+        }
+    }
+    let mut truth_scl_counted: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+    for dex in &truth.dex_states {
+        let token = dex.collateral_token;
+        for (addr, user) in &dex.users {
+            if user.account_mode.is_shared_usdc() {
+                let key = (addr.clone(), token);
+                let scl = if truth_scl_counted.insert(key.clone()) { user.spot_collateral / 100 } else { 0 };
+                *truth_cross_dex.entry(key).or_default() += user.usdc_balance + scl;
+            }
+        }
+        for (addr, partial) in &dex.users_without_positions {
+            if partial.account_mode.is_shared_usdc() {
+                let key = (addr.clone(), token);
+                let scl = if truth_scl_counted.insert(key.clone()) { partial.spot_collateral / 100 } else { 0 };
+                *truth_cross_dex.entry(key).or_default() += partial.usdc_balance + scl;
+            }
+        }
+    }
+    // Track which shared-usdc users have already been compared (to avoid double-counting)
+    let mut compared_shared_usdc: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
 
     // Per-dex comparison
     for (dex_idx, truth_dex) in truth.dex_states.iter().enumerate() {
@@ -814,19 +1083,45 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
             };
 
             {
-                // Per-dex usdc_balance comparison for all users
-                let diff = replay_user.usdc_balance - truth_user.usdc_balance;
-                let diff_usd = diff as f64 / 1e6;
-                let truth_usd = truth_user.usdc_balance as f64 / 1e6;
-                let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
-                if diff.abs() > 1_000_000 {
-                    result.balance_drifts.push(BalanceDrift {
-                        user: addr.clone(),
-                        replay_balance: replay_user.usdc_balance,
-                        truth_balance: truth_user.usdc_balance,
-                        diff_usd,
-                        pct,
-                    });
+                // For shared-usdc users (Unified + DexAbstraction): compare cross-dex
+                // total equity (sum of usdc + scl across all dexes with same collateral token).
+                // Only report once per (user, token) — on the first dex encountered.
+                // For other modes: compare usdc_balance directly per dex.
+                if replay_user.account_mode.is_shared_usdc() {
+                    let token = replay_dex.collateral_token;
+                    let key = (addr.clone(), token);
+                    if !compared_shared_usdc.contains(&key) {
+                        compared_shared_usdc.insert(key.clone());
+                        let replay_total = replay_cross_dex.get(&key).copied().unwrap_or(0);
+                        let truth_total = truth_cross_dex.get(&key).copied().unwrap_or(0);
+                        let diff = replay_total - truth_total;
+                        let diff_usd = diff as f64 / 1e6;
+                        let truth_usd = truth_total as f64 / 1e6;
+                        let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
+                        if diff.abs() > 1_000_000 {
+                            result.balance_drifts.push(BalanceDrift {
+                                user: addr.clone(),
+                                replay_balance: replay_total,
+                                truth_balance: truth_total,
+                                diff_usd,
+                                pct,
+                            });
+                        }
+                    }
+                } else {
+                    let diff = replay_user.usdc_balance - truth_user.usdc_balance;
+                    let diff_usd = diff as f64 / 1e6;
+                    let truth_usd = truth_user.usdc_balance as f64 / 1e6;
+                    let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
+                    if diff.abs() > 1_000_000 {
+                        result.balance_drifts.push(BalanceDrift {
+                            user: addr.clone(),
+                            replay_balance: replay_user.usdc_balance,
+                            truth_balance: truth_user.usdc_balance,
+                            diff_usd,
+                            pct,
+                        });
+                    }
                 }
             }
 
@@ -905,20 +1200,23 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
                 }
             }
 
-            // Compare spot_collateral
-            if replay_user.spot_collateral != truth_user.spot_collateral {
-                let diff = (replay_user.spot_collateral - truth_user.spot_collateral) / 100; // 8→6 dec
-                let diff_usd = diff as f64 / 1e6;
-                let truth_usd = (truth_user.spot_collateral / 100) as f64 / 1e6;
-                let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
-                if diff.abs() > 1_000_000 {
-                    result.scl_drifts.push(BalanceDrift {
-                        user: addr.clone(),
-                        replay_balance: replay_user.spot_collateral / 100,
-                        truth_balance: truth_user.spot_collateral / 100,
-                        diff_usd,
-                        pct,
-                    });
+            // Compare spot_collateral — skip for shared-usdc users since it's
+            // already included in the cross-dex total equity comparison above.
+            if !replay_user.account_mode.is_shared_usdc() {
+                if replay_user.spot_collateral != truth_user.spot_collateral {
+                    let diff = (replay_user.spot_collateral - truth_user.spot_collateral) / 100; // 8→6 dec
+                    let diff_usd = diff as f64 / 1e6;
+                    let truth_usd = (truth_user.spot_collateral / 100) as f64 / 1e6;
+                    let pct = if truth_usd.abs() > 0.01 { (diff_usd / truth_usd) * 100.0 } else { 0.0 };
+                    if diff.abs() > 1_000_000 {
+                        result.scl_drifts.push(BalanceDrift {
+                            user: addr.clone(),
+                            replay_balance: replay_user.spot_collateral / 100,
+                            truth_balance: truth_user.spot_collateral / 100,
+                            diff_usd,
+                            pct,
+                        });
+                    }
                 }
             }
 

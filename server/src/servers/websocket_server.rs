@@ -219,6 +219,8 @@ async fn handle_socket(
     // Track last-sent levels per subscription for delta computation
     let mut last_l2_levels: HashMap<String, [Vec<Level>; 2]> = HashMap::new();
     let mut last_trigger_levels: HashMap<String, [Vec<Level>; 2]> = HashMap::new();
+    // Track last trade price per coin for allMids subscription
+    let mut all_prices: HashMap<String, String> = HashMap::new();
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         send_socket_message(&mut socket, msg).await;
@@ -237,8 +239,8 @@ async fn handle_socket(
                                 if !matches!(sub, Subscription::Bbo { .. }) {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2_levels).await;
                                 }
-                                if let Subscription::TriggerBook { coin, n_sig_figs, n_levels } = sub {
-                                    send_ws_data_from_trigger_book(&mut socket, coin, trigger_snapshots, *time, *n_sig_figs, *n_levels, &mut last_trigger_levels).await;
+                                if let Subscription::TriggerBook { coin, n_sig_figs, n_levels, mantissa } = sub {
+                                    send_ws_data_from_trigger_book(&mut socket, coin, trigger_snapshots, *time, *n_sig_figs, *mantissa, *n_levels, &mut last_trigger_levels).await;
                                 }
                             }
                         },
@@ -267,10 +269,37 @@ async fn handle_socket(
                             }
                         },
                         HftMessage::Fills{ batch } => {
-                            if manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. })) {
+                            let has_trades = manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. }));
+                            let has_all_prices = manager.subscriptions().iter().any(|s| matches!(s, Subscription::AllPrices { .. }));
+                            if has_trades || has_all_prices {
                                 let mut trades = coin_to_trades(batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                if has_trades {
+                                    for sub in manager.subscriptions() {
+                                        send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                    }
+                                }
+                                if has_all_prices {
+                                    // Update last prices and send deltas
+                                    let mut changed: HashMap<String, String> = HashMap::new();
+                                    for (coin, coin_trades) in &trades {
+                                        if let Some(last) = coin_trades.last() {
+                                            let px = last.px().to_string();
+                                            if all_prices.get(coin) != Some(&px) {
+                                                all_prices.insert(coin.clone(), px.clone());
+                                                changed.insert(coin.clone(), px);
+                                            }
+                                        }
+                                    }
+                                    if !changed.is_empty() {
+                                        for sub in manager.subscriptions() {
+                                            if let Subscription::AllPrices { coin, coins } = sub {
+                                                let filtered = filter_prices(&changed, coin, coins);
+                                                if !filtered.is_empty() {
+                                                    send_socket_message(&mut socket, ServerResponse::AllPrices(filtered)).await;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -327,7 +356,7 @@ async fn handle_socket(
                                         send_socket_message(&mut socket, ServerResponse::Pong).await;
                                     }
                                     _ => {
-                                        receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), bbo_only, &mut last_l2_levels, &mut last_trigger_levels).await;
+                                        receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), bbo_only, &mut last_l2_levels, &mut last_trigger_levels, &all_prices).await;
                                     }
                                 }
                             }
@@ -360,6 +389,7 @@ async fn receive_client_message(
     bbo_only: bool,
     last_l2_levels: &mut HashMap<String, [Vec<Level>; 2]>,
     last_trigger_levels: &mut HashMap<String, [Vec<Level>; 2]>,
+    all_prices: &HashMap<String, String>,
 ) {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -391,8 +421,8 @@ async fn receive_client_message(
                 let key = format!("{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0));
                 last_l2_levels.remove(&key);
             }
-            Subscription::TriggerBook { coin, n_sig_figs, .. } => {
-                let key = format!("trigger:{}:{}", coin, n_sig_figs.unwrap_or(0));
+            Subscription::TriggerBook { coin, n_sig_figs, mantissa, .. } => {
+                let key = format!("trigger:{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0));
                 last_trigger_levels.remove(&key);
             }
             _ => {}
@@ -418,10 +448,24 @@ async fn receive_client_message(
         } else {
             None
         };
+        // Extract allPrices filter before consuming client_message
+        let is_all_prices = matches!(&client_message, ClientMessage::Subscribe { subscription: Subscription::AllPrices { .. } });
+        let (ap_coin, ap_coins) = if let ClientMessage::Subscribe { subscription: Subscription::AllPrices { ref coin, ref coins } } = client_message {
+            (coin.clone(), coins.clone())
+        } else {
+            (None, None)
+        };
+
         let msg = ServerResponse::SubscriptionResponse(client_message);
         send_socket_message(socket, msg).await;
         if let Some(snapshot_msg) = snapshot_msg {
             send_socket_message(socket, snapshot_msg).await;
+        }
+        if is_all_prices {
+            let snapshot = filter_prices(all_prices, &ap_coin, &ap_coins);
+            if !snapshot.is_empty() {
+                send_socket_message(socket, ServerResponse::AllPrices(snapshot)).await;
+            }
         }
     } else {
         let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub}"));
@@ -641,19 +685,19 @@ async fn send_ws_data_from_trigger_book(
     trigger_snapshots: &HashMap<Coin, Snapshot<InnerLevel>>,
     time: u64,
     n_sig_figs: Option<u32>,
+    mantissa: Option<u64>,
     _n_levels: Option<usize>,
     last_trigger_levels: &mut HashMap<String, [Vec<Level>; 2]>,
 ) {
     let coin_key = Coin::new(coin);
     if let Some(raw_snapshot) = trigger_snapshots.get(&coin_key) {
-        // Apply nSigFigs if requested, no directional truncation for triggers
-        let snapshot = if n_sig_figs.is_some() {
-            raw_snapshot.to_l2_snapshot(None, n_sig_figs, None)
+        let snapshot = if n_sig_figs.is_some() || mantissa.is_some() {
+            raw_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa)
         } else {
             raw_snapshot.clone()
         };
         let current = snapshot.export_inner_snapshot();
-        let key = format!("trigger:{}:{}", coin, n_sig_figs.unwrap_or(0));
+        let key = format!("trigger:{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0));
 
         let levels_to_send = if let Some(prev) = last_trigger_levels.get(&key) {
             let bid_delta = compute_level_delta(&prev[0], &current[0]);
@@ -671,6 +715,21 @@ async fn send_ws_data_from_trigger_book(
         let trigger_book = TriggerBook { coin: coin.to_string(), time, levels: levels_to_send };
         send_socket_message(socket, ServerResponse::TriggerBook(trigger_book)).await;
     }
+}
+
+fn filter_prices(prices: &HashMap<String, String>, coin: &Option<String>, coins: &Option<Vec<String>>) -> HashMap<String, String> {
+    if coin.is_none() && coins.is_none() {
+        return prices.clone();
+    }
+    prices.iter().filter(|(k, _)| {
+        if let Some(c) = coin {
+            if k.as_str() == c { return true; }
+        }
+        if let Some(cs) = coins {
+            if cs.iter().any(|c| c == k.as_str()) { return true; }
+        }
+        false
+    }).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 fn in_price_range(px: &str, start_px: &Option<String>, end_px: &Option<String>) -> bool {
@@ -694,6 +753,7 @@ fn in_price_range(px: &str, start_px: &Option<String>, end_px: &Option<String>) 
 fn filter_l4_updates(updates: L4BookUpdates, start_px: &Option<String>, end_px: &Option<String>, trigger_only: bool) -> Option<L4BookUpdates> {
     let order_statuses: Vec<_> = updates.order_statuses.into_iter().filter(|s| {
         if trigger_only && !s.order.is_trigger { return false; }
+        if !trigger_only && s.order.is_trigger { return false; }
         let px = if s.order.is_trigger { &s.order.trigger_px } else { &s.order.limit_px };
         in_price_range(px, start_px, end_px)
     }).collect();
@@ -716,12 +776,8 @@ async fn send_ws_data_from_book_updates(
     match subscription {
         Subscription::L4Book { coin, start_px, end_px } => {
             if let Some(updates) = book_updates.get(coin).cloned() {
-                let has_filter = start_px.is_some() || end_px.is_some();
-                let updates = if has_filter {
-                    filter_l4_updates(updates, start_px, end_px, false)
-                } else {
-                    Some(updates)
-                };
+                // Always filter to exclude trigger orders from l4Book
+                let updates = filter_l4_updates(updates, start_px, end_px, false);
                 if let Some(updates) = updates {
                     BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
                     send_socket_message(socket, ServerResponse::L4Book(L4Book::Updates(updates))).await;
@@ -776,6 +832,7 @@ impl Subscription {
                     orders.into_iter()
                         .filter(|o| {
                             if trigger_only && !o.is_trigger { return false; }
+                            if !trigger_only && o.is_trigger { return false; }
                             let px = if o.is_trigger { &o.trigger_px } else { &o.limit_px.to_str() };
                             in_price_range(px, start_px, end_px)
                         })

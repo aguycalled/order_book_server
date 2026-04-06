@@ -337,6 +337,19 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         }
     }
 
+    // Build dex name → pdi map from coin prefixes
+    let mut dex_name_map: HashMap<String, u32> = HashMap::new();
+    dex_name_map.insert(String::new(), 0); // "" = dex 0
+    for dex in &dex_states {
+        if let Some(first_coin) = dex.universe.first() {
+            if first_coin.name.contains(':') {
+                if let Some(prefix) = first_coin.name.split(':').next() {
+                    dex_name_map.insert(prefix.to_string(), dex.pdi);
+                }
+            }
+        }
+    }
+
     Ok(LiquidationState {
         dex_states,
         coin_to_dex_asset,
@@ -350,6 +363,9 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         portfolio_margin_users,
         vault_states,
         mark_prices: HashMap::new(),
+        order_holds: HashMap::new(),
+        spot_pairs: HashMap::new(),
+        dex_name_to_pdi: dex_name_map,
     })
 }
 

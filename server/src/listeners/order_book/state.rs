@@ -175,6 +175,14 @@ impl OrderBookState {
                 let coin = Coin::new(&order_status.order.coin);
                 if self.order_book.cancel_order(oid.clone(), coin.clone()) {
                     changed_coins.insert(coin);
+                    static TRIG_RM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let c = TRIG_RM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c < 20 {
+                        log::info!("Trigger removed: oid={} coin={} status={}", order_status.order.oid, order_status.order.coin, order_status.status);
+                    }
+                    if c % 1000 == 0 {
+                        log::info!("Trigger removals total: {c}");
+                    }
                 }
             }
 

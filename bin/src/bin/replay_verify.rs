@@ -374,6 +374,39 @@ fn main() {
         effective_home_dir = home_dir.clone();
     }
 
+    // Load spot pair metadata from HL API for processing spot fills
+    {
+        let output = std::process::Command::new("curl")
+            .args(["-s", "-X", "POST", "https://api.hyperliquid.xyz/info",
+                   "-H", "Content-Type: application/json",
+                   "-d", r#"{"type":"spotMeta"}"#])
+            .output();
+        if let Ok(output) = output {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                let universe = meta.get("universe").and_then(|u| u.as_array());
+                let tokens = meta.get("tokens").and_then(|t| t.as_array());
+                if let (Some(universe), Some(tokens)) = (universe, tokens) {
+                    for pair in universe {
+                        let name = pair.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let toks = pair.get("tokens").and_then(|t| t.as_array());
+                        if let Some(toks) = toks {
+                            if toks.len() >= 2 {
+                                let base = toks[0].as_u64().unwrap_or(0) as u32;
+                                let quote = toks[1].as_u64().unwrap_or(0) as u32;
+                                let sz_dec = tokens.get(base as usize)
+                                    .and_then(|t| t.get("szDecimals"))
+                                    .and_then(|d| d.as_u64())
+                                    .unwrap_or(8) as u32;
+                                state_a.spot_pairs.insert(name.to_string(), (base, quote, sz_dec));
+                            }
+                        }
+                    }
+                    println!("  {} spot pairs loaded from API", state_a.spot_pairs.len());
+                }
+            }
+        }
+    }
+
     // Step 3: First-pass replay
     if args.trace_drifters {
         state_a.enable_event_log();
@@ -610,6 +643,18 @@ fn main() {
                         m.user, m.asset_idx, m.coin, m.replay_szi, m.truth_szi,
                     )
                     .ok();
+                }
+            }
+
+            // Write cb drift details sorted by magnitude
+            if !r.cost_basis_drifts.is_empty() {
+                writeln!(f, "\n  Cost basis drifts (top 20):").ok();
+                let mut sorted_cb: Vec<_> = r.cost_basis_drifts.iter().collect();
+                sorted_cb.sort_by(|a, b| (b.replay_val - b.truth_val).abs().cmp(&(a.replay_val - a.truth_val).abs()));
+                for d in sorted_cb.iter().take(20) {
+                    let diff = d.replay_val - d.truth_val;
+                    writeln!(f, "    {} asset={} coin={}: replay={} truth={} diff={} (${:.2})",
+                        d.user, d.asset_idx, d.coin, d.replay_val, d.truth_val, diff, diff as f64 / 1e6).ok();
                 }
             }
 

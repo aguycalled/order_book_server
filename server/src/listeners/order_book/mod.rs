@@ -234,7 +234,11 @@ impl OrderBookListener {
             // Skip events at or before the initial snapshot height
             // (only during initial catch-up, not after)
             static INITIAL_HEIGHT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let snap_height = *INITIAL_HEIGHT.get_or_init(|| state.height());
+            let snap_height = *INITIAL_HEIGHT.get_or_init(|| {
+                let h = state.height();
+                log::info!("INITIAL_HEIGHT set to {h}");
+                h
+            });
             if height <= snap_height {
                 return Ok(());
             }

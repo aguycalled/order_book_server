@@ -352,12 +352,13 @@ pub fn apply_replica_block(
                 Action::SubAccountTransfer { sub_account_user, is_deposit, usd } => {
                     let Some(user) = &user else { continue };
                     let sub = sub_account_user.to_lowercase();
+                    // Sub-account transfers target dex 0 (main perps).
                     if *is_deposit {
-                        state.apply_usd_transfer(user, -*usd);
-                        state.apply_usd_transfer(&sub, *usd);
+                        state.apply_usd_transfer_on_dex(user, -*usd, 0);
+                        state.apply_usd_transfer_on_dex(&sub, *usd, 0);
                     } else {
-                        state.apply_usd_transfer(&sub, -*usd);
-                        state.apply_usd_transfer(user, *usd);
+                        state.apply_usd_transfer_on_dex(&sub, -*usd, 0);
+                        state.apply_usd_transfer_on_dex(user, *usd, 0);
                     }
                     affected_users.insert(user.clone());
                     affected_users.insert(sub);
@@ -413,7 +414,8 @@ pub fn apply_replica_block(
                     let src = source_dex.as_deref().unwrap_or("");
                     let dst = destination_dex.as_deref().unwrap_or("");
 
-                    let is_perps_dex = |dex: &str| matches!(dex, "" | "xyz" | "flx" | "vntl" | "hyna" | "km" | "abcd");
+                    let src_pdi = state.dex_name_to_pdi.get(src).copied();
+                    let dst_pdi = state.dex_name_to_pdi.get(dst).copied();
                     let is_spot = |dex: &str| dex == "spot";
 
                     if source_dex.is_none() && destination_dex.is_none() {
@@ -423,16 +425,19 @@ pub fn apply_replica_block(
                         state.apply_spot_transfer(&dest, token_id, delta);
                     } else {
                         // Source side
-                        if is_perps_dex(src) {
-                            state.apply_usd_transfer(&sender, -micro);
+                        if let Some(pdi) = src_pdi {
+                            state.apply_usd_transfer_on_dex(&sender, -micro, pdi);
                         } else if is_spot(src) {
+                            // Spot source: deduct from SCL for shared-usdc users
+                            // (both Unified and DexAbs track USDC in SCL)
                             let delta = (amt * 1e8).round() as i64;
                             state.apply_spot_transfer(&sender, token_id, -delta);
                         }
                         // Destination side
-                        if is_perps_dex(dst) {
-                            state.apply_usd_transfer(&dest, micro);
+                        if let Some(pdi) = dst_pdi {
+                            state.apply_usd_transfer_on_dex(&dest, micro, pdi);
                         } else if is_spot(dst) {
+                            // Spot destination: add to SCL for shared-usdc users
                             let delta = (amt * 1e8).round() as i64;
                             state.apply_spot_transfer(&dest, token_id, delta);
                         }

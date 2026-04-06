@@ -4,7 +4,7 @@ use crate::types::{Bbo, L2Book, L4Book, Trade, TriggerBook};
 use alloy::primitives::Address;
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const MAX_LEVELS: usize = 400;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
@@ -35,7 +35,10 @@ pub(crate) enum Subscription {
     #[serde(rename_all = "camelCase")]
     OrderUpdates { user: String },
     #[serde(rename_all = "camelCase")]
-    TriggerBook { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize> },
+    TriggerBook { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
+    /// Last trade price for all markets. Optional coin filter (single or list).
+    #[serde(rename_all = "camelCase")]
+    AllPrices { coin: Option<String>, coins: Option<Vec<String>> },
 }
 
 impl Subscription {
@@ -98,7 +101,7 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
-            Self::TriggerBook { coin, n_sig_figs, n_levels } => {
+            Self::TriggerBook { coin, n_sig_figs, n_levels, mantissa } => {
                 if !universe.contains(coin) {
                     info!("Invalid subscription: coin not found");
                     return false;
@@ -112,6 +115,31 @@ impl Subscription {
                     if !(2..=5).contains(&n) {
                         info!("Invalid subscription: sig figs must be 2-5");
                         return false;
+                    }
+                    if let Some(m) = *mantissa {
+                        if n < 5 || (m != 5 && m != 2) {
+                            return false;
+                        }
+                    }
+                } else if mantissa.is_some() {
+                    info!("Invalid subscription: mantissa requires nSigFigs");
+                    return false;
+                }
+                true
+            }
+            Self::AllPrices { coin, coins } => {
+                if let Some(c) = coin {
+                    if !universe.contains(c) {
+                        info!("Invalid subscription: coin not found");
+                        return false;
+                    }
+                }
+                if let Some(cs) = coins {
+                    for c in cs {
+                        if !universe.contains(c) {
+                            info!("Invalid subscription: coin {c} not found");
+                            return false;
+                        }
                     }
                 }
                 true
@@ -143,6 +171,7 @@ impl Subscription {
             Self::Trades { .. } => "trades",
             Self::OrderUpdates { .. } => "orderUpdates",
             Self::TriggerBook { .. } => "triggerBook",
+            Self::AllPrices { .. } => "allPrices",
         }
     }
 }
@@ -175,6 +204,7 @@ pub(crate) enum ServerResponse {
     Bbo(Bbo),
     OrderUpdates(Vec<OrderUpdate>),
     TriggerBook(TriggerBook),
+    AllPrices(HashMap<String, String>),
     Pong,
     Error(String),
 }

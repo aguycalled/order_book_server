@@ -193,8 +193,12 @@ impl<O: InnerOrder> OrderBook<O> {
             }
         });
         // Second pass: insert triggers without matching
+        let n_triggers = triggers.len();
         for order in triggers {
             book.insert_resting(order);
+        }
+        if n_triggers > 0 {
+            log::info!("from_snapshot: loaded {} trigger orders", n_triggers);
         }
         book
     }
@@ -224,6 +228,11 @@ fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>
             break;
         }
         while let Some(match_order) = list.head_value_ref_mut_unsafe() {
+            // Skip trigger orders — they sit in the book passively and
+            // should not participate in the matching engine
+            if match_order.is_trigger() {
+                break;
+            }
             taker_order.fill(match_order);
             if match_order.sz().is_zero() {
                 filled_oids.push(match_order.oid());

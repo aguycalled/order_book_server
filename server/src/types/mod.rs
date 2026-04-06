@@ -156,6 +156,10 @@ impl Trade {
             user,
         }
     }
+
+    pub(crate) fn px(&self) -> &str {
+        &self.px
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
