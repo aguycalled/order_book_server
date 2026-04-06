@@ -345,16 +345,16 @@ pub fn apply_replica_block(
                     affected_users.insert(dest);
                 }
                 Action::UsdClassTransfer { amount, to_perp } => {
+                    // Moves USDC between spot (SCL) and perps (dex 0)
                     let Some(user) = &user else { continue };
                     let amt: f64 = amount.parse().unwrap_or(0.0);
                     let micro = (amt * 1e6).round() as i64;
+                    let spot_delta = (amt * 1e8).round() as i64;
                     if *to_perp {
-                        state.apply_usd_transfer(user, micro);
-                        let spot_delta = (amt * 1e8).round() as i64;
+                        state.apply_usd_transfer_on_dex(user, micro, 0);
                         state.apply_spot_transfer(user, 0, -spot_delta);
                     } else {
-                        state.apply_usd_transfer(user, -micro);
-                        let spot_delta = (amt * 1e8).round() as i64;
+                        state.apply_usd_transfer_on_dex(user, -micro, 0);
                         state.apply_spot_transfer(user, 0, spot_delta);
                     }
                     affected_users.insert(user.clone());
@@ -374,10 +374,11 @@ pub fn apply_replica_block(
                     affected_users.insert(sub);
                 }
                 Action::Withdraw3 { amount } => {
+                    // Withdrawals deduct from perps usdc (dex 0)
                     let Some(user) = &user else { continue };
                     let amt: f64 = amount.parse().unwrap_or(0.0);
                     let micro = (amt * 1e6).round() as i64;
-                    state.apply_usd_transfer(user, -micro);
+                    state.apply_usd_transfer_on_dex(user, -micro, 0);
                     affected_users.insert(user.clone());
                 }
                 Action::SpotSend { destination, token, amount } => {

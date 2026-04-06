@@ -399,12 +399,32 @@ fn apply_ledger_update(state: &mut LiquidationState, ledger: &LedgerUpdateEvent)
             }
             false
         }
+        LedgerDelta::SpotTransfer(v) => {
+            // System spot transfers (from 0x2000...) are not in replica_cmds.
+            // User-initiated spot transfers ARE in replica_cmds (spotSend action).
+            let sender = v.get("user").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let is_system = sender.starts_with("0x2000000000000000000000000000000000");
+            if is_system {
+                let dest = v.get("destination").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let amount_str = v.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
+                let amt: f64 = amount_str.parse().unwrap_or(0.0);
+                let token_name = v.get("token").and_then(|v| v.as_str()).unwrap_or("USDC");
+                let token_id: u32 = match token_name {
+                    "USDC" => 0, "USDH" => 360, "USDE" => 235, _ => 0,
+                };
+                if amt > 0.0 && !dest.is_empty() {
+                    let delta = (amt * 1e8).round() as i64;
+                    state.apply_spot_transfer(&dest, token_id, delta);
+                    return true;
+                }
+            }
+            false
+        }
         // All these are already handled by replica_cmds — skip
         LedgerDelta::Deposit(_)
         | LedgerDelta::Withdraw(_)
         | LedgerDelta::InternalTransfer(_)
         | LedgerDelta::SubAccountTransfer(_)
-        | LedgerDelta::SpotTransfer(_)
         | LedgerDelta::AccountClassTransfer(_)
         | LedgerDelta::VaultCreate(_)
         | LedgerDelta::VaultDeposit(_)
