@@ -435,19 +435,52 @@ pub fn apply_replica_block(
                         state.apply_spot_transfer(&sender, token_id, -delta);
                         state.apply_spot_transfer(&dest, token_id, delta);
                     } else {
-                        // Source side
+                        // Source side: sender's mode determines where funds leave from
                         if let Some(pdi) = src_pdi {
                             state.apply_usd_transfer_on_dex(&sender, -micro, pdi);
                         } else if is_spot(src) {
                             let delta = (amt * 1e8).round() as i64;
                             state.apply_spot_transfer(&sender, token_id, -delta);
                         }
-                        // Destination side
-                        if let Some(pdi) = dst_pdi {
-                            state.apply_usd_transfer_on_dex(&dest, micro, pdi);
-                        } else if is_spot(dst) {
-                            let delta = (amt * 1e8).round() as i64;
-                            state.apply_spot_transfer(&dest, token_id, delta);
+
+                        // Destination side: receiver's account mode determines routing.
+                        // - Unified: always to spot (SCL)
+                        // - Standard: respects destinationDex literally
+                        // - DexAbstraction: USDC to dex 0 if perps dest, non-USDC to spot
+                        let dest_mode = state.dex_states.iter().find_map(|dex| {
+                            dex.users.get(&dest).map(|u| u.account_mode)
+                                .or_else(|| dex.users_without_positions.get(&dest).map(|p| p.account_mode))
+                        }).unwrap_or(super::AccountMode::Standard);
+
+                        match dest_mode {
+                            super::AccountMode::Unified => {
+                                // Unified: all incoming funds go to spot (SCL)
+                                let delta = (amt * 1e8).round() as i64;
+                                state.apply_spot_transfer(&dest, token_id, delta);
+                            }
+                            super::AccountMode::DexAbstraction => {
+                                // DexAbs: USDC to dex 0 if perps, non-USDC to spot
+                                if token_id == 0 {
+                                    if let Some(pdi) = dst_pdi {
+                                        state.apply_usd_transfer_on_dex(&dest, micro, pdi);
+                                    } else {
+                                        let delta = (amt * 1e8).round() as i64;
+                                        state.apply_spot_transfer(&dest, token_id, delta);
+                                    }
+                                } else {
+                                    let delta = (amt * 1e8).round() as i64;
+                                    state.apply_spot_transfer(&dest, token_id, delta);
+                                }
+                            }
+                            _ => {
+                                // Standard: respect destinationDex
+                                if let Some(pdi) = dst_pdi {
+                                    state.apply_usd_transfer_on_dex(&dest, micro, pdi);
+                                } else if is_spot(dst) {
+                                    let delta = (amt * 1e8).round() as i64;
+                                    state.apply_spot_transfer(&dest, token_id, delta);
+                                }
+                            }
                         }
                     }
                     affected_users.insert(sender);
