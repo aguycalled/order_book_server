@@ -146,6 +146,10 @@ pub struct LiquidationState {
     pub unified_balances: HashMap<(String, u32), i64>,
     /// Per-user action counter: fills + replica actions applied.
     pub user_action_counts: HashMap<String, u32>,
+    /// Users who should be compared for replay correctness.
+    /// Seeded from start-snapshot active perp positions and updated on each
+    /// non-spot fill seen during replay.
+    pub users_with_perp_positions: std::collections::HashSet<String>,
     /// Per-user borrow/supply state from locus.blp, keyed by (user, token_id).
     /// Amounts in 8-decimal (weiDecimals) units.
     pub borrow_lend_states: HashMap<(String, u32), BorrowLendState>,
@@ -228,7 +232,8 @@ impl LiquidationState {
             if self.debug_users.contains(&user.to_lowercase()) {
                 eprintln!(
                     "  → PM AUTO-REPAY: ${:.2} repaid from usdc, borrow remaining=${:.2}",
-                    repay_micro as f64 / 1e6, bls.borrowed as f64 / 1e8
+                    repay_micro as f64 / 1e6,
+                    bls.borrowed as f64 / 1e8
                 );
             }
         } else if delta_micro < 0 {
@@ -253,7 +258,8 @@ impl LiquidationState {
                 if self.debug_users.contains(&user.to_lowercase()) {
                     eprintln!(
                         "  → PM AUTO-BORROW: ${:.2} borrowed to usdc, total borrow=${:.2}",
-                        borrow_micro as f64 / 1e6, bls.borrowed as f64 / 1e8
+                        borrow_micro as f64 / 1e6,
+                        bls.borrowed as f64 / 1e8
                     );
                 }
             }
@@ -267,10 +273,8 @@ impl LiquidationState {
         let user = user_addr.to_lowercase();
 
         // Look up ownership fraction
-        let fraction = self.vault_states.get(&vault)
-            .and_then(|vs| vs.user_ownership.get(&user))
-            .copied()
-            .unwrap_or(0.0);
+        let fraction =
+            self.vault_states.get(&vault).and_then(|vs| vs.user_ownership.get(&user)).copied().unwrap_or(0.0);
         if fraction == 0.0 {
             return 0;
         }
@@ -289,7 +293,11 @@ impl LiquidationState {
         if self.debug_users.contains(&vault) || self.debug_users.contains(&user) {
             eprintln!(
                 "[DEBUG vault_withdrawal] vault={} user={} fraction={:.6} vault_usdc=${:.2} withdrawal=${:.2}",
-                vault, user, fraction, vault_usdc as f64 / 1e6, withdrawal as f64 / 1e6
+                vault,
+                user,
+                fraction,
+                vault_usdc as f64 / 1e6,
+                withdrawal as f64 / 1e6
             );
         }
 
@@ -673,10 +681,7 @@ pub fn replay_interleaved(
     let hip3_local = data_dir.join("hip3_oracle_updates_streaming");
     let hip3_home = home_dir.join("hl/data/hip3_oracle_updates_streaming");
     let hip3_real = dirs::home_dir().unwrap_or_default().join("hl/data/hip3_oracle_updates_streaming");
-    let hip3_oracle_dir = [hip3_local, hip3_home, hip3_real]
-        .into_iter()
-        .find(|d| d.exists())
-        .unwrap_or_default();
+    let hip3_oracle_dir = [hip3_local, hip3_home, hip3_real].into_iter().find(|d| d.exists()).unwrap_or_default();
     let mut hip3_oracle_batches: Vec<(u64, String)> = Vec::new();
     if hip3_oracle_dir.exists() {
         // Use same hourly file matching as fills
@@ -700,7 +705,9 @@ pub fn replay_interleaved(
                     for line in reader.lines() {
                         let Ok(line) = line else { break };
                         let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
+                        if trimmed.is_empty() {
+                            continue;
+                        }
                         if let Some(pos) = trimmed.find("\"block_number\":") {
                             let num_start = pos + 15;
                             let num_end = trimmed[num_start..]
@@ -839,32 +846,32 @@ pub fn replay_interleaved(
             }
             EventType::Replica => {
                 match serde_json::from_str::<replica::ReplicaBlock>(line) {
-                Ok(block) => {
-                    // Log state-mutating replica actions
-                    if state.event_log.is_some() {
-                        for (_, bundle) in &block.abci_block.signed_action_bundles {
-                            for sa in &bundle.signed_actions {
-                                if !sa.action.is_ignored() {
-                                    let desc = format!("replica {:?}", sa.action);
-                                    // Best effort: get user from vault_address or action
-                                    if let Some(ref va) = sa.vault_address {
-                                        state.log_event(&va.to_lowercase(), *block_num, desc);
+                    Ok(block) => {
+                        // Log state-mutating replica actions
+                        if state.event_log.is_some() {
+                            for (_, bundle) in &block.abci_block.signed_action_bundles {
+                                for sa in &bundle.signed_actions {
+                                    if !sa.action.is_ignored() {
+                                        let desc = format!("replica {:?}", sa.action);
+                                        // Best effort: get user from vault_address or action
+                                        if let Some(ref va) = sa.vault_address {
+                                            state.log_event(&va.to_lowercase(), *block_num, desc);
+                                        }
                                     }
                                 }
                             }
                         }
+                        if replica::apply_replica_block(state, &block).is_ok() {
+                            total_replica += 1;
+                        }
                     }
-                    if replica::apply_replica_block(state, &block).is_ok() {
-                        total_replica += 1;
+                    Err(e) => {
+                        // Log first few failures
+                        if total_replica < 3 {
+                            warn!("Failed to deserialize replica block: {e}");
+                            warn!("  line (first 300 chars): {}", &line[..line.len().min(300)]);
+                        }
                     }
-                }
-                Err(e) => {
-                    // Log first few failures
-                    if total_replica < 3 {
-                        warn!("Failed to deserialize replica block: {e}");
-                        warn!("  line (first 300 chars): {}", &line[..line.len().min(300)]);
-                    }
-                }
                 }
             }
             EventType::MiscEvent => {
@@ -964,7 +971,6 @@ pub struct LeverageMismatch {
     pub truth_lev: String,
 }
 
-
 /// Compare leverage type and value, ignoring raw_usd drift (which comes from funding).
 fn leverage_type_matches(a: &Leverage, b: &Leverage) -> bool {
     match (a, b) {
@@ -982,9 +988,11 @@ fn format_leverage(lev: &Leverage) -> String {
 }
 
 /// Compare replayed state against ground truth (parsed second snapshot).
-/// Per-dex, per-field comparison. For Unified/DexAbstraction users, balance comparison
-/// sums usdc across all dexes with the same collateral token + SCL, since the protocol
-/// silently rebalances between them.
+/// Per-dex, per-field comparison for users who had an active perp position in
+/// the start snapshot or were touched by a non-spot fill during replay.
+/// For Unified/DexAbstraction users, balance comparison sums usdc across all
+/// dexes with the same collateral token + SCL, since the protocol silently
+/// rebalances between them.
 pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Vec<ComparisonResult> {
     let mut results = Vec::new();
 
@@ -1030,11 +1038,24 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
     // Per-dex comparison
     for (dex_idx, truth_dex) in truth.dex_states.iter().enumerate() {
         let replay_dex = replay.dex_states.get(dex_idx);
+        let truth_users: std::collections::BTreeSet<String> = truth_dex
+            .users
+            .keys()
+            .chain(truth_dex.users_without_positions.keys())
+            .filter(|addr| replay.users_with_perp_positions.contains(*addr))
+            .cloned()
+            .collect();
+        let replay_users: std::collections::BTreeSet<String> = replay_dex
+            .into_iter()
+            .flat_map(|dex| dex.users.keys().chain(dex.users_without_positions.keys()))
+            .filter(|addr| replay.users_with_perp_positions.contains(*addr))
+            .cloned()
+            .collect();
 
         let mut result = ComparisonResult {
             dex_idx,
-            users_in_truth: truth_dex.users.len(),
-            users_in_replay: replay_dex.map_or(0, |d| d.users.len()),
+            users_in_truth: truth_users.len(),
+            users_in_replay: replay_users.len(),
             szi_matches: 0,
             szi_mismatches: Vec::new(),
             balance_drifts: Vec::new(),
@@ -1048,7 +1069,7 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
         };
 
         let Some(replay_dex) = replay_dex else {
-            result.missing_after_replay = truth_dex.users.keys().cloned().collect();
+            result.missing_after_replay = truth_users.into_iter().collect();
             results.push(result);
             continue;
         };
@@ -1058,7 +1079,7 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
             truth_dex.universe.iter().enumerate().map(|(i, a)| (i as u32, a.name.as_str())).collect();
 
         // Check each user in truth
-        for (addr, truth_user) in &truth_dex.users {
+        for addr in &truth_users {
             // Skip portfolio margin users — borrow mechanics not yet replicated
             if truth.portfolio_margin_users.contains(addr) {
                 continue;
@@ -1067,10 +1088,13 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
             if truth.vault_states.contains_key(addr) {
                 continue;
             }
-            let Some(replay_user) = replay_dex.users.get(addr) else {
+            let truth_user = truth_dex.users.get(addr);
+            let replay_user = replay_dex.users.get(addr);
+            let replay_partial = replay_dex.users_without_positions.get(addr);
+            if replay_user.is_none() && replay_partial.is_none() {
                 result.missing_after_replay.push(addr.clone());
                 continue;
-            };
+            }
 
             {
                 // Compare cross-dex total equity (usdc + spot) per collateral token.
@@ -1098,102 +1122,106 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
             }
 
             // Compare positions
-            for (asset_idx, truth_pos) in &truth_user.positions {
-                let coin = asset_to_coin.get(asset_idx).unwrap_or(&"?");
-                let Some(replay_pos) = replay_user.positions.get(asset_idx) else {
-                    result.szi_mismatches.push(SziMismatch {
-                        user: addr.clone(),
-                        asset_idx: *asset_idx,
-                        coin: coin.to_string(),
-                        replay_szi: 0,
-                        truth_szi: truth_pos.szi,
-                    });
-                    continue;
-                };
-
-                if replay_pos.szi == truth_pos.szi {
-                    result.szi_matches += 1;
-                } else {
-                    result.szi_mismatches.push(SziMismatch {
-                        user: addr.clone(),
-                        asset_idx: *asset_idx,
-                        coin: coin.to_string(),
-                        replay_szi: replay_pos.szi,
-                        truth_szi: truth_pos.szi,
-                    });
-                }
-
-                // Compare leverage type + value
-                if !leverage_type_matches(&replay_pos.leverage, &truth_pos.leverage) {
-                    result.leverage_mismatches.push(LeverageMismatch {
-                        user: addr.clone(),
-                        asset_idx: *asset_idx,
-                        coin: coin.to_string(),
-                        replay_lev: format_leverage(&replay_pos.leverage),
-                        truth_lev: format_leverage(&truth_pos.leverage),
-                    });
-                }
-
-                // Compare cost_basis
-                if replay_pos.cost_basis != truth_pos.cost_basis {
-                    result.cost_basis_drifts.push(PositionFieldDrift {
-                        user: addr.clone(),
-                        asset_idx: *asset_idx,
-                        coin: coin.to_string(),
-                        replay_val: replay_pos.cost_basis,
-                        truth_val: truth_pos.cost_basis,
-                    });
-                }
-
-                // Compare raw_usd (isolated positions)
-                if let (Leverage::Isolated { raw_usd: r_raw, .. }, Leverage::Isolated { raw_usd: t_raw, .. })
-                    = (&replay_pos.leverage, &truth_pos.leverage)
-                {
-                    if r_raw != t_raw {
-                        result.raw_usd_drifts.push(PositionFieldDrift {
+            if let Some(truth_user) = truth_user {
+                for (asset_idx, truth_pos) in &truth_user.positions {
+                    let coin = asset_to_coin.get(asset_idx).unwrap_or(&"?");
+                    let Some(replay_pos) = replay_user.and_then(|u| u.positions.get(asset_idx)) else {
+                        result.szi_mismatches.push(SziMismatch {
                             user: addr.clone(),
                             asset_idx: *asset_idx,
                             coin: coin.to_string(),
-                            replay_val: *r_raw,
-                            truth_val: *t_raw,
+                            replay_szi: 0,
+                            truth_szi: truth_pos.szi,
+                        });
+                        continue;
+                    };
+
+                    if replay_pos.szi == truth_pos.szi {
+                        result.szi_matches += 1;
+                    } else {
+                        result.szi_mismatches.push(SziMismatch {
+                            user: addr.clone(),
+                            asset_idx: *asset_idx,
+                            coin: coin.to_string(),
+                            replay_szi: replay_pos.szi,
+                            truth_szi: truth_pos.szi,
                         });
                     }
-                }
 
-                // Compare outstanding_funding
-                if replay_pos.outstanding_funding != truth_pos.outstanding_funding {
-                    result.funding_drifts.push(PositionFieldDrift {
-                        user: addr.clone(),
-                        asset_idx: *asset_idx,
-                        coin: coin.to_string(),
-                        replay_val: replay_pos.outstanding_funding,
-                        truth_val: truth_pos.outstanding_funding,
-                    });
+                    // Compare leverage type + value
+                    if !leverage_type_matches(&replay_pos.leverage, &truth_pos.leverage) {
+                        result.leverage_mismatches.push(LeverageMismatch {
+                            user: addr.clone(),
+                            asset_idx: *asset_idx,
+                            coin: coin.to_string(),
+                            replay_lev: format_leverage(&replay_pos.leverage),
+                            truth_lev: format_leverage(&truth_pos.leverage),
+                        });
+                    }
+
+                    // Compare cost_basis
+                    if replay_pos.cost_basis != truth_pos.cost_basis {
+                        result.cost_basis_drifts.push(PositionFieldDrift {
+                            user: addr.clone(),
+                            asset_idx: *asset_idx,
+                            coin: coin.to_string(),
+                            replay_val: replay_pos.cost_basis,
+                            truth_val: truth_pos.cost_basis,
+                        });
+                    }
+
+                    // Compare raw_usd (isolated positions)
+                    if let (Leverage::Isolated { raw_usd: r_raw, .. }, Leverage::Isolated { raw_usd: t_raw, .. }) =
+                        (&replay_pos.leverage, &truth_pos.leverage)
+                    {
+                        if r_raw != t_raw {
+                            result.raw_usd_drifts.push(PositionFieldDrift {
+                                user: addr.clone(),
+                                asset_idx: *asset_idx,
+                                coin: coin.to_string(),
+                                replay_val: *r_raw,
+                                truth_val: *t_raw,
+                            });
+                        }
+                    }
+
+                    // Compare outstanding_funding
+                    if replay_pos.outstanding_funding != truth_pos.outstanding_funding {
+                        result.funding_drifts.push(PositionFieldDrift {
+                            user: addr.clone(),
+                            asset_idx: *asset_idx,
+                            coin: coin.to_string(),
+                            replay_val: replay_pos.outstanding_funding,
+                            truth_val: truth_pos.outstanding_funding,
+                        });
+                    }
                 }
             }
 
             // spot_collateral is included in the cross-dex total above — no separate check.
-            {
-            }
+            {}
 
             // Check for extra positions in replay
-            for (asset_idx, replay_pos) in &replay_user.positions {
-                if !truth_user.positions.contains_key(asset_idx) {
-                    let coin = asset_to_coin.get(asset_idx).unwrap_or(&"?");
-                    result.szi_mismatches.push(SziMismatch {
-                        user: addr.clone(),
-                        asset_idx: *asset_idx,
-                        coin: coin.to_string(),
-                        replay_szi: replay_pos.szi,
-                        truth_szi: 0,
-                    });
+            if let Some(replay_user) = replay_user {
+                let truth_positions = truth_user.map(|u| &u.positions);
+                for (asset_idx, replay_pos) in &replay_user.positions {
+                    if truth_positions.is_none_or(|positions| !positions.contains_key(asset_idx)) {
+                        let coin = asset_to_coin.get(asset_idx).unwrap_or(&"?");
+                        result.szi_mismatches.push(SziMismatch {
+                            user: addr.clone(),
+                            asset_idx: *asset_idx,
+                            coin: coin.to_string(),
+                            replay_szi: replay_pos.szi,
+                            truth_szi: 0,
+                        });
+                    }
                 }
             }
         }
 
         // Check for extra users in replay
-        for addr in replay_dex.users.keys() {
-            if !truth_dex.users.contains_key(addr) {
+        for addr in &replay_users {
+            if !truth_users.contains(addr) {
                 result.extra_after_replay.push(addr.clone());
             }
         }
@@ -1202,4 +1230,164 @@ pub fn compare_states(replay: &LiquidationState, truth: &LiquidationState) -> Ve
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state() -> LiquidationState {
+        LiquidationState {
+            dex_states: vec![DexState {
+                pdi: 0,
+                universe: vec![AssetMeta {
+                    name: "BTC".to_string(),
+                    sz_decimals: 0,
+                    margin_table_id: 0,
+                    margin_mode: MarginMode::Normal,
+                }],
+                margin_tables: HashMap::new(),
+                oracle_prices: vec![0],
+                users: HashMap::new(),
+                collateral_token: 0,
+                users_without_positions: HashMap::new(),
+            }],
+            coin_to_dex_asset: HashMap::from([("BTC".to_string(), (0, 0))]),
+            processed_withdrawal_nonces: std::collections::HashSet::new(),
+            debug_users: std::collections::HashSet::new(),
+            positions_needing_leverage_fix: Vec::new(),
+            event_log: None,
+            unified_balances: HashMap::new(),
+            user_action_counts: HashMap::new(),
+            users_with_perp_positions: std::collections::HashSet::new(),
+            borrow_lend_states: HashMap::new(),
+            portfolio_margin_users: std::collections::HashSet::new(),
+            vault_states: HashMap::new(),
+            mark_prices: HashMap::new(),
+            order_holds: HashMap::new(),
+            spot_pairs: HashMap::new(),
+            dex_name_to_pdi: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn compare_states_ignores_partial_users_without_perp_replay_relevance() {
+        let mut replay = make_state();
+        let mut truth = make_state();
+        let user = "0xabc".to_string();
+
+        replay.dex_states[0].users_without_positions.insert(
+            user.clone(),
+            UserStatePartial {
+                usdc_balance: 90_000_000,
+                spot_collateral: 0,
+                spot_collateral_decimals: 8,
+                account_mode: AccountMode::Standard,
+                leverage_settings: HashMap::new(),
+            },
+        );
+        truth.dex_states[0].users_without_positions.insert(
+            user.clone(),
+            UserStatePartial {
+                usdc_balance: 100_000_000,
+                spot_collateral: 0,
+                spot_collateral_decimals: 8,
+                account_mode: AccountMode::Standard,
+                leverage_settings: HashMap::new(),
+            },
+        );
+
+        let results = compare_states(&replay, &truth);
+        let result = &results[0];
+
+        assert_eq!(result.users_in_truth, 0);
+        assert_eq!(result.users_in_replay, 0);
+        assert!(result.balance_drifts.is_empty());
+    }
+
+    #[test]
+    fn compare_states_includes_partial_users_with_perp_replay_relevance() {
+        let mut replay = make_state();
+        let mut truth = make_state();
+        let user = "0xdef".to_string();
+
+        replay.users_with_perp_positions.insert(user.clone());
+        replay.dex_states[0].users_without_positions.insert(
+            user.clone(),
+            UserStatePartial {
+                usdc_balance: 90_000_000,
+                spot_collateral: 0,
+                spot_collateral_decimals: 8,
+                account_mode: AccountMode::Standard,
+                leverage_settings: HashMap::new(),
+            },
+        );
+        truth.dex_states[0].users_without_positions.insert(
+            user.clone(),
+            UserStatePartial {
+                usdc_balance: 100_000_000,
+                spot_collateral: 0,
+                spot_collateral_decimals: 8,
+                account_mode: AccountMode::Standard,
+                leverage_settings: HashMap::new(),
+            },
+        );
+
+        let results = compare_states(&replay, &truth);
+        let result = &results[0];
+
+        assert_eq!(result.users_in_truth, 1);
+        assert_eq!(result.users_in_replay, 1);
+        assert_eq!(result.balance_drifts.len(), 1);
+        assert_eq!(result.balance_drifts[0].user, user);
+    }
+
+    #[test]
+    fn compare_states_ignores_missing_partial_users_without_perp_replay_relevance() {
+        let replay = make_state();
+        let mut truth = make_state();
+        let user = "0x123".to_string();
+
+        truth.dex_states[0].users_without_positions.insert(
+            user.clone(),
+            UserStatePartial {
+                usdc_balance: 12_000_000,
+                spot_collateral: 0,
+                spot_collateral_decimals: 8,
+                account_mode: AccountMode::Standard,
+                leverage_settings: HashMap::new(),
+            },
+        );
+
+        let results = compare_states(&replay, &truth);
+        let result = &results[0];
+
+        assert_eq!(result.users_in_truth, 0);
+        assert!(result.missing_after_replay.is_empty());
+    }
+
+    #[test]
+    fn compare_states_marks_missing_partial_users_with_perp_replay_relevance() {
+        let mut replay = make_state();
+        let mut truth = make_state();
+        let user = "0x456".to_string();
+
+        replay.users_with_perp_positions.insert(user.clone());
+        truth.dex_states[0].users_without_positions.insert(
+            user.clone(),
+            UserStatePartial {
+                usdc_balance: 12_000_000,
+                spot_collateral: 0,
+                spot_collateral_decimals: 8,
+                account_mode: AccountMode::Standard,
+                leverage_settings: HashMap::new(),
+            },
+        );
+
+        let results = compare_states(&replay, &truth);
+        let result = &results[0];
+
+        assert_eq!(result.users_in_truth, 1);
+        assert!(result.missing_after_replay.contains(&user));
+    }
 }

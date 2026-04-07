@@ -344,6 +344,8 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
             }
         }
     }
+    let users_with_perp_positions: HashSet<String> =
+        dex_states.iter().flat_map(|dex| dex.users.keys().cloned()).collect();
 
     Ok(LiquidationState {
         dex_states,
@@ -354,6 +356,7 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         event_log: None,
         unified_balances,
         user_action_counts: HashMap::new(),
+        users_with_perp_positions,
         borrow_lend_states,
         portfolio_margin_users,
         vault_states,
