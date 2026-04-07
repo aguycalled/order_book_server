@@ -398,6 +398,19 @@ fn main() {
                                     .and_then(|d| d.as_u64())
                                     .unwrap_or(8) as u32;
                                 state_a.spot_pairs.insert(name.to_string(), (base, quote, sz_dec));
+                                // Also index by "BASE/QUOTE" name (e.g. "PURR/USDC")
+                                let base_name = tokens.get(base as usize)
+                                    .and_then(|t| t.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("");
+                                let quote_name = tokens.get(quote as usize)
+                                    .and_then(|t| t.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("");
+                                if !base_name.is_empty() && !quote_name.is_empty() {
+                                    let pair_name = format!("{}/{}", base_name, quote_name);
+                                    state_a.spot_pairs.insert(pair_name, (base, quote, sz_dec));
+                                }
                             }
                         }
                     }

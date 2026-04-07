@@ -21,8 +21,8 @@ impl LiquidationState {
     /// Apply a fill to update a user's position and balance.
     /// Returns the affected coin name if the user was found/created.
     pub(crate) fn apply_fill(&mut self, user: &str, fill: &Fill) -> Option<String> {
-        // Handle spot fills (coin starts with "@")
-        if fill.coin.starts_with('@') {
+        // Handle spot fills (coin starts with "@" or contains "/" like "PURR/USDC")
+        if fill.coin.starts_with('@') || fill.coin.contains('/') {
             return self.apply_spot_fill(user, fill);
         }
 
