@@ -447,10 +447,16 @@ pub fn apply_replica_block(
                         // - Unified: always to spot (SCL)
                         // - Standard: respects destinationDex literally
                         // - DexAbstraction: USDC to dex 0 if perps dest, non-USDC to spot
-                        let dest_mode = state.dex_states.iter().find_map(|dex| {
-                            dex.users.get(&dest).map(|u| u.account_mode)
-                                .or_else(|| dex.users_without_positions.get(&dest).map(|p| p.account_mode))
-                        }).unwrap_or(super::AccountMode::Standard);
+                        let dest_mode = state
+                            .dex_states
+                            .iter()
+                            .find_map(|dex| {
+                                dex.users
+                                    .get(&dest)
+                                    .map(|u| u.account_mode)
+                                    .or_else(|| dex.users_without_positions.get(&dest).map(|p| p.account_mode))
+                            })
+                            .unwrap_or(super::AccountMode::Standard);
 
                         match dest_mode {
                             super::AccountMode::Unified => {
@@ -489,12 +495,19 @@ pub fn apply_replica_block(
                 Action::VaultTransfer { vault_address, is_deposit, usd } => {
                     let vault = vault_address.to_lowercase();
                     let Some(user) = &user else { continue };
-                    let amount = if *usd == 0 && !*is_deposit {
-                        // usd=0 withdrawal: compute from vault equity × user's ownership fraction
-                        state.compute_vault_withdrawal(&vault, user)
-                    } else {
-                        *usd
-                    };
+                    if *usd == 0 && !*is_deposit {
+                        // usd=0 withdrawal: deferred to misc_events VaultWithdraw handler
+                        // which has the exact netWithdrawnUsd amount from the LedgerUpdate.
+                        affected_users.insert(user.clone());
+                        affected_users.insert(vault);
+                        continue;
+                    }
+                    let amount = *usd;
+                    // Record that this vault withdrawal was handled with exact amount,
+                    // so the misc event handler won't double-count it.
+                    if !*is_deposit {
+                        state.processed_vault_withdrawals.insert((vault.clone(), user.clone()));
+                    }
                     if *is_deposit {
                         state.apply_usd_transfer(user, -amount);
                         state.apply_usd_transfer(&vault, amount);
@@ -551,7 +564,8 @@ pub fn apply_replica_block(
                         );
                     }
                     if is_new {
-                        state.apply_usd_transfer(&target, *usd);
+                        // ETH deposits are always USDC — route to dex 0.
+                        state.apply_usd_transfer_on_dex(&target, *usd, 0);
                         affected_users.insert(target);
                     }
                 }
@@ -620,7 +634,9 @@ pub fn apply_replica_block(
                                             let px_str = arr[1].as_str().unwrap_or("");
                                             if let Ok(px) = px_str.parse::<f64>() {
                                                 // Find asset index by coin name
-                                                if let Some(ai) = state.dex_states[di].universe.iter().position(|a| a.name == coin) {
+                                                if let Some(ai) =
+                                                    state.dex_states[di].universe.iter().position(|a| a.name == coin)
+                                                {
                                                     state.mark_prices.insert((di, ai as u32), px);
                                                 }
                                             }

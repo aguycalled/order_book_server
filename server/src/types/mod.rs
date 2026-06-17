@@ -240,6 +240,14 @@ pub(crate) struct Fill {
     #[serde(default)]
     pub twap_id: Option<u64>,
     pub liquidation: Option<Liquidation>,
+    /// Builder address credited on this fill (HIP-3 / builder-code orders).
+    /// Present directly on the fill — no order-status cache needed.
+    #[serde(default)]
+    pub builder: Option<String>,
+    /// Exact builder fee we earned on this fill, quote-denominated decimal
+    /// string (e.g. "0.003537"). Authoritative — no `notional × f` estimate.
+    #[serde(default)]
+    pub builder_fee: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,4 +256,46 @@ pub(crate) struct Liquidation {
     pub liquidated_user: String,
     pub mark_px: String,
     pub method: String,
+}
+
+// ── Liquidation map types ───────────────────────────────────────────────
+
+/// L2-style aggregated liquidation heatmap: price buckets with total size/count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidationMapData {
+    pub coin: String,
+    pub time: u64,
+    /// [longs_liquidated (below mark), shorts_liquidated (above mark)]
+    pub levels: [Vec<LiquidationLevel>; 2],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidationLevel {
+    pub px: String,
+    pub coin_sz: String,
+    pub ntl_sz: String,
+    pub n: usize,
+}
+
+/// L4 per-user liquidation detail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct L4LiquidationMapData {
+    pub coin: String,
+    pub time: u64,
+    pub positions: Vec<L4LiquidationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct L4LiquidationEntry {
+    pub user: String,
+    pub side: String,
+    pub sz: String,
+    pub entry_px: String,
+    pub liq_px: String,
+    pub leverage: String,
+    pub margin_type: String,
 }

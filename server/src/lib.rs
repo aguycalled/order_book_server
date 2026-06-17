@@ -5,7 +5,9 @@ mod listeners;
 pub mod metrics;
 mod order_book;
 mod prelude;
+pub mod referral;
 mod servers;
+pub mod strategy;
 mod types;
 
 use std::path::PathBuf;
@@ -59,4 +61,18 @@ pub struct ServerConfig {
     pub bbo_only: bool,
     /// Path to the L2 history RocksDB database (optional override)
     pub history_db_path: Option<PathBuf>,
+    /// Build and serve a liquidation map via WebSocket subscriptions.
+    /// Loads clearing house state from RMP snapshots and tracks fills.
+    pub build_liquidation_map: bool,
+    /// Path to the referral-stats RocksDB database (optional override).
+    pub referral_stats_db_path: Option<PathBuf>,
+    /// Path to the per-strategy-stats RocksDB database (optional override).
+    pub strategy_stats_db_path: Option<PathBuf>,
+    /// Referral code whose users we track (e.g. "HYBRIDGE"). Case-insensitive.
+    pub track_referral_code: String,
+    /// Builder address whose fills we track (0x-prefixed hex).
+    pub track_builder_address: String,
+    /// Fraction of a referee's gross fee paid out to us as referral reward
+    /// (e.g. 0.10 = 10%). Confirm against current Hyperliquid referral terms.
+    pub referral_reward_rate: f64,
 }

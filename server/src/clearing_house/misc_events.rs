@@ -385,14 +385,19 @@ fn apply_ledger_update(state: &mut LiquidationState, ledger: &LedgerUpdateEvent)
                 if amt > 0.0 {
                     let dest_addr = dest.to_lowercase();
                     let token_name = v.get("token").and_then(|v| v.as_str()).unwrap_or("USDC");
+                    // Bridge deposits are stablecoins — default to USDC for unknown tokens.
                     let token_id: u32 = match token_name {
-                        "USDC" => 0, "USDH" => 360, "USDE" => 235, _ => 0,
+                        "USDC" => 0,
+                        "USDH" => 360,
+                        "USDE" => 235,
+                        _ => 0,
                     };
                     if is_perps_dst {
-                        // Bridge deposit directly to perps dex
+                        // Bridge deposit directly to perps dex.
+                        // For Unified users, route to SCL (cross-dex shared balance).
                         let micro = (amt * 1e6).round() as i64;
                         let pdi = state.dex_name_to_pdi.get(dst).copied().unwrap_or(0);
-                        state.apply_usd_transfer_on_dex(&dest_addr, micro, pdi);
+                        state.apply_usd_transfer_on_dex_unified_scl(&dest_addr, micro, pdi);
                     } else {
                         // Bridge deposit to spot (SCL)
                         let delta = (amt * 1e8).round() as i64;
@@ -404,21 +409,79 @@ fn apply_ledger_update(state: &mut LiquidationState, ledger: &LedgerUpdateEvent)
             false
         }
         LedgerDelta::SpotTransfer(v) => {
-            // System spot transfers (from 0x2000...) are not in replica_cmds.
-            // User-initiated spot transfers ARE in replica_cmds (spotSend action).
+            // System spot transfers (from/to 0x2000...) are not in replica_cmds.
+            // User-initiated spot transfers ARE in replica_cmds (spotSend action),
+            // EXCEPT for system-routed flows like accountClassTransfer → spotTransfer chains.
             let sender = v.get("user").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let is_system = sender.starts_with("0x2000000000000000000000000000000000");
-            if is_system {
-                let dest = v.get("destination").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let dest = v.get("destination").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let is_system_sender = sender.starts_with("0x2000000000000000000000000000000000");
+            let is_system_dest = dest.starts_with("0x2000000000000000000000000000000000");
+            if is_system_sender || is_system_dest {
                 let amount_str = v.get("amount").and_then(|v| v.as_str()).unwrap_or("0");
                 let amt: f64 = amount_str.parse().unwrap_or(0.0);
                 let token_name = v.get("token").and_then(|v| v.as_str()).unwrap_or("USDC");
-                let token_id: u32 = match token_name {
-                    "USDC" => 0, "USDH" => 360, "USDE" => 235, _ => 0,
+                let token_id: Option<u32> = match token_name {
+                    "USDC" => Some(0),
+                    "USDH" => Some(360),
+                    "USDE" => Some(235),
+                    _ => None,
                 };
-                if amt > 0.0 && !dest.is_empty() {
-                    let delta = (amt * 1e8).round() as i64;
-                    state.apply_spot_transfer(&dest, token_id, delta);
+                if let Some(token_id) = token_id {
+                    if amt > 0.0 {
+                        let delta = (amt * 1e8).round() as i64;
+                        if is_system_sender && !dest.is_empty() {
+                            // Incoming from system → credit destination
+                            state.apply_spot_transfer(&dest, token_id, delta);
+                            return true;
+                        } else if is_system_dest && !sender.is_empty() {
+                            // Outgoing to system (bridge withdrawal) → debit sender
+                            state.apply_spot_transfer(&sender, token_id, -delta);
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        LedgerDelta::VaultWithdraw(v) => {
+            // Vault withdrawals: replica handles usd>0 cases with exact amount.
+            // For usd=0 (equity-based), replica defers here since we have the
+            // exact netWithdrawnUsd from the LedgerUpdate.
+            let user_addr = v.get("user").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let vault_addr = v.get("vault").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            // Skip if the replica already processed this with an exact amount.
+            if state.processed_vault_withdrawals.contains(&(vault_addr.clone(), user_addr.clone())) {
+                return false;
+            }
+            let net_usd_str = v.get("netWithdrawnUsd").and_then(|v| v.as_str()).unwrap_or("0");
+            let net_usd: f64 = net_usd_str.parse().unwrap_or(0.0);
+            if net_usd != 0.0 && !user_addr.is_empty() {
+                let micro = (net_usd * 1e6).round() as i64;
+                state.apply_usd_transfer(&vault_addr, -micro);
+                state.apply_usd_transfer(&user_addr, micro);
+                return true;
+            }
+            false
+        }
+        LedgerDelta::AccountClassTransfer(v) => {
+            // accountClassTransfer: moves USDC between perps (usdc_balance) and spot (SCL).
+            // Sometimes accompanies updateIsolatedMargin and only appears in misc events
+            // (no replica UsdClassTransfer counterpart). User comes from outer event.
+            let usdc_str = v.get("usdc").and_then(|v| v.as_str()).unwrap_or("0");
+            let to_perp = v.get("toPerp").and_then(|v| v.as_bool()).unwrap_or(false);
+            let amt: f64 = usdc_str.parse().unwrap_or(0.0);
+            if amt > 0.0 {
+                if let Some(user_addr) = ledger.users.first() {
+                    let user_addr = user_addr.to_lowercase();
+                    let micro = (amt * 1e6).round() as i64;
+                    let spot_delta = (amt * 1e8).round() as i64;
+                    if to_perp {
+                        state.apply_usd_transfer_on_dex(&user_addr, micro, 0);
+                        state.apply_spot_transfer(&user_addr, 0, -spot_delta);
+                    } else {
+                        state.apply_usd_transfer_on_dex(&user_addr, -micro, 0);
+                        state.apply_spot_transfer(&user_addr, 0, spot_delta);
+                    }
                     return true;
                 }
             }
@@ -429,10 +492,8 @@ fn apply_ledger_update(state: &mut LiquidationState, ledger: &LedgerUpdateEvent)
         | LedgerDelta::Withdraw(_)
         | LedgerDelta::InternalTransfer(_)
         | LedgerDelta::SubAccountTransfer(_)
-        | LedgerDelta::AccountClassTransfer(_)
         | LedgerDelta::VaultCreate(_)
         | LedgerDelta::VaultDeposit(_)
-        | LedgerDelta::VaultWithdraw(_)
         | LedgerDelta::BorrowLend(_)
         | LedgerDelta::SpotGenesis(_)
         | LedgerDelta::CStakingTransfer(_)

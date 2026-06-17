@@ -21,11 +21,7 @@ impl OrderBook<crate::types::inner::InnerL4Order> {
     /// Build aggregated trigger order book levels.
     /// Market trigger orders are bucketed by trigger_px; limit triggers by limit_px.
     #[must_use]
-    pub(crate) fn to_trigger_snapshot(
-        &self,
-        n_levels: Option<usize>,
-        n_sig_figs: Option<u32>,
-    ) -> Snapshot<InnerLevel> {
+    pub(crate) fn to_trigger_snapshot(&self, n_levels: Option<usize>, n_sig_figs: Option<u32>) -> Snapshot<InnerLevel> {
         let bid_levels = map_trigger_levels(&self.bids, Side::Bid, n_levels, n_sig_figs);
         let ask_levels = map_trigger_levels(&self.asks, Side::Ask, n_levels, n_sig_figs);
         Snapshot([bid_levels, ask_levels])
@@ -47,8 +43,7 @@ fn map_trigger_levels(
         let trigger_orders: Vec<(Px, Sz)> = order_list.fold(Vec::new(), |acc, order| {
             if order.is_trigger {
                 let effective_px = if order.trigger_px != "0.0" && !order.trigger_px.is_empty() {
-                    if order.order_type.contains("market") || order.order_type.contains("Market")
-                        || order.tif.is_none()
+                    if order.order_type.contains("market") || order.order_type.contains("Market") || order.tif.is_none()
                     {
                         Px::parse_from_str(&order.trigger_px).unwrap_or(order.limit_px)
                     } else {
@@ -73,8 +68,7 @@ fn map_trigger_levels(
         Side::Bid => Box::new(aggregated.iter().rev()),
         Side::Ask => Box::new(aggregated.iter()),
     };
-    iter.map(|(px, (sz, n))| InnerLevel { px: *px, sz: *sz, n: *n })
-        .collect()
+    iter.map(|(px, (sz, n))| InnerLevel { px: *px, sz: *sz, n: *n }).collect()
 }
 
 impl<O: InnerOrder> OrderBook<O> {
@@ -153,8 +147,16 @@ fn map_to_l2_levels<O: InnerOrder>(
     };
     for (px, orders) in order_iter {
         // Sum only non-trigger orders for L2 levels
-        let sz = orders.fold(Sz::new(0), |sz, order| { if !order.is_trigger() { *sz = *sz + order.sz(); } });
-        let n = orders.fold(0, |n, order| { if !order.is_trigger() { *n += 1; } });
+        let sz = orders.fold(Sz::new(0), |sz, order| {
+            if !order.is_trigger() {
+                *sz = *sz + order.sz();
+            }
+        });
+        let n = orders.fold(0, |n, order| {
+            if !order.is_trigger() {
+                *n += 1;
+            }
+        });
         if n == 0 {
             continue;
         }

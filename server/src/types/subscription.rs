@@ -1,6 +1,6 @@
 use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
 use crate::types::node_data::NodeDataOrderStatus;
-use crate::types::{Bbo, L2Book, L4Book, Trade, TriggerBook};
+use crate::types::{Bbo, L2Book, L4Book, L4LiquidationMapData, LiquidationMapData, Trade, TriggerBook};
 use alloy::primitives::Address;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_LEVELS: usize = 400;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
+pub(crate) const DEFAULT_LIQ_LEVELS: usize = 250;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method")]
@@ -39,6 +40,12 @@ pub(crate) enum Subscription {
     /// Last trade price for all markets. Optional coin filter (single or list).
     #[serde(rename_all = "camelCase")]
     AllPrices { coin: Option<String>, coins: Option<Vec<String>> },
+    /// L2 aggregated liquidation heatmap: price buckets with total size/count.
+    #[serde(rename_all = "camelCase")]
+    LiquidationMap { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
+    /// L4 per-user liquidation detail: each user's position + liquidation price.
+    #[serde(rename_all = "camelCase")]
+    L4LiquidationMap { coin: String, start_px: Option<String>, end_px: Option<String> },
 }
 
 impl Subscription {
@@ -144,6 +151,42 @@ impl Subscription {
                 }
                 true
             }
+            Self::LiquidationMap { coin, n_sig_figs, n_levels, mantissa } => {
+                if !universe.contains(coin) {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                let n_levels = n_levels.unwrap_or(DEFAULT_LIQ_LEVELS);
+                if n_levels > MAX_LEVELS {
+                    return false;
+                }
+                if let Some(n) = *n_sig_figs {
+                    if !(2..=5).contains(&n) {
+                        return false;
+                    }
+                    if let Some(m) = *mantissa {
+                        if n < 5 || (m != 5 && m != 2) {
+                            return false;
+                        }
+                    }
+                } else if mantissa.is_some() {
+                    return false;
+                }
+                true
+            }
+            Self::L4LiquidationMap { coin, start_px, end_px } => {
+                if !universe.contains(coin) {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                if let (Some(s), Some(e)) = (start_px, end_px) {
+                    match (s.parse::<f64>(), e.parse::<f64>()) {
+                        (Ok(sv), Ok(ev)) if sv <= ev => {}
+                        _ => return false,
+                    }
+                }
+                true
+            }
             Self::OrderUpdates { user } => {
                 // Validate the user address format (must be valid hex address)
                 if user.len() != 42 || !user.starts_with("0x") {
@@ -172,6 +215,8 @@ impl Subscription {
             Self::OrderUpdates { .. } => "orderUpdates",
             Self::TriggerBook { .. } => "triggerBook",
             Self::AllPrices { .. } => "allPrices",
+            Self::LiquidationMap { .. } => "liquidationMap",
+            Self::L4LiquidationMap { .. } => "l4LiquidationMap",
         }
     }
 }
@@ -205,6 +250,8 @@ pub(crate) enum ServerResponse {
     OrderUpdates(Vec<OrderUpdate>),
     TriggerBook(TriggerBook),
     AllPrices(HashMap<String, String>),
+    LiquidationMap(LiquidationMapData),
+    L4LiquidationMap(L4LiquidationMapData),
     Pong,
     Error(String),
 }

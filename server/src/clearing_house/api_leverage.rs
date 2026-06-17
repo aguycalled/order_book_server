@@ -15,10 +15,7 @@ use super::{Leverage, LiquidationState};
 /// After a first-pass replay, query the API for users with unknown leverage
 /// and inject the correct settings into the given initial state (for second-pass replay).
 /// Returns the number of leverage settings injected.
-pub fn inject_leverage_from_api(
-    first_pass_state: &LiquidationState,
-    initial_state: &mut LiquidationState,
-) -> usize {
+pub fn inject_leverage_from_api(first_pass_state: &LiquidationState, initial_state: &mut LiquidationState) -> usize {
     let needs_fix = &first_pass_state.positions_needing_leverage_fix;
     if needs_fix.is_empty() {
         return 0;
@@ -26,11 +23,7 @@ pub fn inject_leverage_from_api(
 
     // Deduplicate users
     let unique_users: HashSet<String> = needs_fix.iter().map(|(u, _, _)| u.clone()).collect();
-    info!(
-        "Querying HL API for {} users ({} positions) with unknown leverage...",
-        unique_users.len(),
-        needs_fix.len()
-    );
+    info!("Querying HL API for {} users ({} positions) with unknown leverage...", unique_users.len(), needs_fix.len());
 
     // Build coin name lookup: (dex_idx, asset_idx) → coin_name
     let mut asset_to_coin: HashMap<(usize, u32), String> = HashMap::new();
@@ -78,11 +71,8 @@ pub fn inject_leverage_from_api(
         let Some(user_levs) = api_leverage.get(user) else { continue };
         let Some(&(is_cross, lev_value)) = user_levs.get(&coin) else { continue };
 
-        let new_lev = if is_cross {
-            Leverage::Cross(lev_value)
-        } else {
-            Leverage::Isolated { leverage: lev_value, raw_usd: 0 }
-        };
+        let new_lev =
+            if is_cross { Leverage::Cross(lev_value) } else { Leverage::Isolated { leverage: lev_value, raw_usd: 0 } };
 
         let Some(dex) = initial_state.dex_states.get_mut(*dex_idx) else { continue };
 
@@ -100,15 +90,18 @@ pub fn inject_leverage_from_api(
         }
         // User doesn't exist in initial state at all — create a partial entry
         // so when their first fill comes, they'll get the correct leverage
-        dex.users_without_positions.entry(user.clone()).or_insert_with(|| {
-            super::UserStatePartial {
+        dex.users_without_positions
+            .entry(user.clone())
+            .or_insert_with(|| super::UserStatePartial {
                 usdc_balance: 0,
                 spot_collateral: 0,
                 spot_collateral_decimals: 8,
                 account_mode: super::AccountMode::Standard,
                 leverage_settings: HashMap::new(),
-            }
-        }).leverage_settings.entry(*asset_idx).or_insert(new_lev);
+            })
+            .leverage_settings
+            .entry(*asset_idx)
+            .or_insert(new_lev);
         injected += 1;
     }
 
@@ -117,10 +110,7 @@ pub fn inject_leverage_from_api(
 }
 
 /// Query clearinghouseState for a user and extract per-coin leverage.
-fn query_user_leverage(
-    client: &ureq::Agent,
-    user: &str,
-) -> Result<HashMap<String, (bool, u32)>, String> {
+fn query_user_leverage(client: &ureq::Agent, user: &str) -> Result<HashMap<String, (bool, u32)>, String> {
     let body = serde_json::json!({
         "type": "clearinghouseState",
         "user": user,

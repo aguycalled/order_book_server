@@ -96,6 +96,35 @@ struct Args {
     /// Log level: error, warn, info, debug, trace
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Build and serve a liquidation map via WebSocket subscriptions.
+    /// Loads clearing house state from RMP snapshots, tracks fills and replica
+    /// actions, and computes per-coin liquidation price heatmaps.
+    #[arg(long)]
+    build_liquidation_map: bool,
+
+    /// Path to the referral-stats RocksDB database.
+    /// Default: <data_dir>/referral_stats.rocksdb
+    #[arg(long)]
+    referral_stats_db_path: Option<PathBuf>,
+
+    /// Path to the per-strategy-stats RocksDB database.
+    /// Default: <data_dir>/strategy_stats.rocksdb
+    #[arg(long)]
+    strategy_stats_db_path: Option<PathBuf>,
+
+    /// Referral code whose users we track (case-insensitive).
+    #[arg(long, default_value = "HYBRIDGE")]
+    track_referral_code: String,
+
+    /// Builder address whose fills we also count (0x-prefixed hex).
+    #[arg(long, default_value = "0x74c362cd3a141769f38c48d66ee51b1938ea4bd0")]
+    track_builder_address: String,
+
+    /// Fraction of a referee's gross fee we earn as referral reward
+    /// (0.10 = 10%). Confirm against current Hyperliquid referral terms.
+    #[arg(long, default_value_t = 0.10)]
+    referral_reward_rate: f64,
 }
 
 /// Start the Prometheus metrics HTTP server
@@ -160,6 +189,12 @@ async fn main() -> Result<()> {
         metrics_port: args.metrics_port,
         bbo_only: args.bbo_only,
         history_db_path: args.history_db_path,
+        build_liquidation_map: args.build_liquidation_map,
+        referral_stats_db_path: args.referral_stats_db_path,
+        strategy_stats_db_path: args.strategy_stats_db_path,
+        track_referral_code: args.track_referral_code,
+        track_builder_address: args.track_builder_address,
+        referral_reward_rate: args.referral_reward_rate,
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));

@@ -281,15 +281,25 @@ fn main() {
             total_drifts += r.balance_drifts.len();
             total_lev += r.leverage_mismatches.len();
             total_szi += r.szi_mismatches.len();
-            let dex_name = state_a.dex_states.get(r.dex_idx)
-                .map(|d| format!("pdi={}", d.pdi))
-                .unwrap_or_else(|| "?".to_string());
+            let dex_name =
+                state_a.dex_states.get(r.dex_idx).map(|d| format!("pdi={}", d.pdi)).unwrap_or_else(|| "?".to_string());
             if !r.balance_drifts.is_empty() || !r.leverage_mismatches.is_empty() || !r.szi_mismatches.is_empty() {
-                println!("  Dex {} ({}): {} balance drifts, {} leverage mismatches, {} szi mismatches",
-                    r.dex_idx, dex_name, r.balance_drifts.len(), r.leverage_mismatches.len(), r.szi_mismatches.len());
+                println!(
+                    "  Dex {} ({}): {} balance drifts, {} leverage mismatches, {} szi mismatches",
+                    r.dex_idx,
+                    dex_name,
+                    r.balance_drifts.len(),
+                    r.leverage_mismatches.len(),
+                    r.szi_mismatches.len()
+                );
                 for d in r.balance_drifts.iter().take(5) {
-                    println!("    {} replay=${:.2} truth=${:.2} diff=${:.2}",
-                        d.user, d.replay_balance as f64 / 1e6, d.truth_balance as f64 / 1e6, d.diff_usd);
+                    println!(
+                        "    {} replay=${:.2} truth=${:.2} diff=${:.2}",
+                        d.user,
+                        d.replay_balance as f64 / 1e6,
+                        d.truth_balance as f64 / 1e6,
+                        d.diff_usd
+                    );
                 }
                 for m in r.leverage_mismatches.iter().take(5) {
                     println!("    {} asset={} replay={} truth={}", m.user, m.asset_idx, m.replay_lev, m.truth_lev);
@@ -299,7 +309,10 @@ fn main() {
         if total_drifts == 0 && total_lev == 0 && total_szi == 0 {
             println!("  PASS: parsing is lossless — zero diffs across all {} dexes", results.len());
         } else {
-            println!("  FAIL: {} balance drifts, {} leverage mismatches, {} szi mismatches", total_drifts, total_lev, total_szi);
+            println!(
+                "  FAIL: {} balance drifts, {} leverage mismatches, {} szi mismatches",
+                total_drifts, total_lev, total_szi
+            );
         }
         println!();
         if args.from_block.is_none() {
@@ -348,7 +361,9 @@ fn main() {
                             }
                         }
                     }
-                    if found { break; }
+                    if found {
+                        break;
+                    }
                 }
             }
             found
@@ -377,9 +392,16 @@ fn main() {
     // Load spot pair metadata from HL API for processing spot fills
     {
         let output = std::process::Command::new("curl")
-            .args(["-s", "-X", "POST", "https://api.hyperliquid.xyz/info",
-                   "-H", "Content-Type: application/json",
-                   "-d", r#"{"type":"spotMeta"}"#])
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "https://api.hyperliquid.xyz/info",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                r#"{"type":"spotMeta"}"#,
+            ])
             .output();
         if let Ok(output) = output {
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
@@ -393,17 +415,20 @@ fn main() {
                             if toks.len() >= 2 {
                                 let base = toks[0].as_u64().unwrap_or(0) as u32;
                                 let quote = toks[1].as_u64().unwrap_or(0) as u32;
-                                let sz_dec = tokens.get(base as usize)
+                                let sz_dec = tokens
+                                    .get(base as usize)
                                     .and_then(|t| t.get("szDecimals"))
                                     .and_then(|d| d.as_u64())
                                     .unwrap_or(8) as u32;
                                 state_a.spot_pairs.insert(name.to_string(), (base, quote, sz_dec));
                                 // Also index by "BASE/QUOTE" name (e.g. "PURR/USDC")
-                                let base_name = tokens.get(base as usize)
+                                let base_name = tokens
+                                    .get(base as usize)
                                     .and_then(|t| t.get("name"))
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("");
-                                let quote_name = tokens.get(quote as usize)
+                                let quote_name = tokens
+                                    .get(quote as usize)
                                     .and_then(|t| t.get("name"))
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("");
@@ -426,7 +451,8 @@ fn main() {
     }
     println!("Pass 1: Replaying fills + replica from block {} to {}...", block_a, block_b);
     let t = Instant::now();
-    let (n_fills, n_replica) = replay_interleaved(&effective_data_dir, &effective_home_dir, &mut state_a, block_a, block_b);
+    let (n_fills, n_replica) =
+        replay_interleaved(&effective_data_dir, &effective_home_dir, &mut state_a, block_a, block_b);
     let replay_time = t.elapsed();
     println!("  {} fills, {} replica blocks in {:.1}s", n_fills, n_replica, replay_time.as_secs_f64());
     let needs_api_fix = state_a.positions_needing_leverage_fix.len();
@@ -458,7 +484,8 @@ fn main() {
         // Second-pass replay with correct leverage
         println!("Pass 2: Replaying with corrected leverage...");
         let t = Instant::now();
-        let (n_fills2, n_replica2) = replay_interleaved(&effective_data_dir, &effective_home_dir, &mut state_a_fresh, block_a, block_b);
+        let (n_fills2, n_replica2) =
+            replay_interleaved(&effective_data_dir, &effective_home_dir, &mut state_a_fresh, block_a, block_b);
         let replay2_time = t.elapsed();
         let remaining = state_a_fresh.positions_needing_leverage_fix.len();
         println!("  {} fills, {} replica blocks in {:.1}s", n_fills2, n_replica2, replay2_time.as_secs_f64());
@@ -666,8 +693,18 @@ fn main() {
                 sorted_cb.sort_by(|a, b| (b.replay_val - b.truth_val).abs().cmp(&(a.replay_val - a.truth_val).abs()));
                 for d in sorted_cb.iter().take(20) {
                     let diff = d.replay_val - d.truth_val;
-                    writeln!(f, "    {} asset={} coin={}: replay={} truth={} diff={} (${:.2})",
-                        d.user, d.asset_idx, d.coin, d.replay_val, d.truth_val, diff, diff as f64 / 1e6).ok();
+                    writeln!(
+                        f,
+                        "    {} asset={} coin={}: replay={} truth={} diff={} (${:.2})",
+                        d.user,
+                        d.asset_idx,
+                        d.coin,
+                        d.replay_val,
+                        d.truth_val,
+                        diff,
+                        diff as f64 / 1e6
+                    )
+                    .ok();
                 }
             }
 
@@ -752,11 +789,17 @@ fn main() {
             let start = pos + needle.len();
             let rest = &line[start..];
             let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-            if end == 0 { return None; }
+            if end == 0 {
+                return None;
+            }
             rest[..end].parse().ok()
         }
 
-        let copy_matching_files = |src_dir: &std::path::Path, dest_subdir: &str, label: &str, check_block_range: bool, filter_by_filename: bool| {
+        let copy_matching_files = |src_dir: &std::path::Path,
+                                   dest_subdir: &str,
+                                   label: &str,
+                                   check_block_range: bool,
+                                   filter_by_filename: bool| {
             if !src_dir.exists() {
                 return 0u64;
             }
@@ -766,7 +809,11 @@ fn main() {
                 let Ok(entries) = std::fs::read_dir(dir) else { return };
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir() { collect(&path, out); } else { out.push(path); }
+                    if path.is_dir() {
+                        collect(&path, out);
+                    } else {
+                        out.push(path);
+                    }
                 }
             }
             collect(src_dir, &mut files);
@@ -775,9 +822,8 @@ fn main() {
             for path in &files {
                 // For replica_cmds: filename is the base block number
                 if filter_by_filename {
-                    if let Some(file_block) = path.file_name()
-                        .and_then(|s| s.to_str())
-                        .and_then(|s| s.parse::<u64>().ok())
+                    if let Some(file_block) =
+                        path.file_name().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok())
                     {
                         if file_block > block_b || file_block + 10_000 <= block_a {
                             continue;
@@ -1003,19 +1049,32 @@ fn write_user_state_to_string(state: &LiquidationState, user: &str, out: &mut St
         if let Some(us) = dex.users.get(user) {
             found = true;
             out.push_str(&format!("  dex[{}] pdi={} (users):\n", di, dex.pdi));
-            out.push_str(&format!("    usdc=${:.2} scl={} mode={:?}\n", us.usdc_balance as f64 / 1e6, us.spot_collateral, us.account_mode));
+            out.push_str(&format!(
+                "    usdc=${:.2} scl={} mode={:?}\n",
+                us.usdc_balance as f64 / 1e6,
+                us.spot_collateral,
+                us.account_mode
+            ));
             let mut keys: Vec<_> = us.positions.keys().collect();
             keys.sort();
             for &k in &keys {
                 let p = &us.positions[k];
                 let coin = dex.universe.get(*k as usize).map(|a| a.name.as_str()).unwrap_or("?");
-                out.push_str(&format!("    pos[{}] {}: szi={} cb={} lev={:?} funding={}\n", k, coin, p.szi, p.cost_basis, p.leverage, p.outstanding_funding));
+                out.push_str(&format!(
+                    "    pos[{}] {}: szi={} cb={} lev={:?} funding={}\n",
+                    k, coin, p.szi, p.cost_basis, p.leverage, p.outstanding_funding
+                ));
             }
         }
         if let Some(partial) = dex.users_without_positions.get(user) {
             found = true;
             out.push_str(&format!("  dex[{}] pdi={} (partial):\n", di, dex.pdi));
-            out.push_str(&format!("    usdc=${:.2} scl={} mode={:?}\n", partial.usdc_balance as f64 / 1e6, partial.spot_collateral, partial.account_mode));
+            out.push_str(&format!(
+                "    usdc=${:.2} scl={} mode={:?}\n",
+                partial.usdc_balance as f64 / 1e6,
+                partial.spot_collateral,
+                partial.account_mode
+            ));
         }
     }
     if !found {
