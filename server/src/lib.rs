@@ -5,7 +5,9 @@ mod listeners;
 pub mod metrics;
 mod order_book;
 mod prelude;
+pub mod referral;
 mod servers;
+pub mod strategy;
 mod types;
 
 use std::path::PathBuf;
@@ -14,6 +16,32 @@ use clap::ValueEnum;
 
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
+
+/// Open a RocksDB, transparently repairing it if the first open fails.
+///
+/// orderbook_server owns several RocksDBs but can be killed without a clean
+/// shutdown (SIGTERM/SIGKILL/OOM/crash, or a supervisor restarting it around
+/// an hl-node upgrade), which leaves the MANIFEST/WAL in a state the next
+/// `DB::open` rejects (`Corruption: ... wal_dir contains existing log file`,
+/// or a truncated MANIFEST referencing a compacted-away `.sst`). `DB::repair`
+/// rebuilds the MANIFEST from the on-disk SST + WAL files, recovering the data.
+/// A fresh/empty path opens cleanly on the first try, so repair only runs on a
+/// genuinely broken store.
+pub fn open_db_with_repair(
+    opts: &rocksdb::Options,
+    path: &std::path::Path,
+) -> std::result::Result<rocksdb::DB, rocksdb::Error> {
+    match rocksdb::DB::open(opts, path) {
+        Ok(db) => Ok(db),
+        Err(first_err) => {
+            log::warn!("RocksDB open failed at {} ({first_err}); attempting repair", path.display());
+            rocksdb::DB::repair(opts, path)?;
+            let db = rocksdb::DB::open(opts, path)?;
+            log::warn!("RocksDB repaired and reopened at {}", path.display());
+            Ok(db)
+        }
+    }
+}
 
 /// Snapshot fetching mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -59,4 +87,18 @@ pub struct ServerConfig {
     pub bbo_only: bool,
     /// Path to the L2 history RocksDB database (optional override)
     pub history_db_path: Option<PathBuf>,
+    /// Build and serve a liquidation map via WebSocket subscriptions.
+    /// Loads clearing house state from RMP snapshots and tracks fills.
+    pub build_liquidation_map: bool,
+    /// Path to the referral-stats RocksDB database (optional override).
+    pub referral_stats_db_path: Option<PathBuf>,
+    /// Path to the per-strategy-stats RocksDB database (optional override).
+    pub strategy_stats_db_path: Option<PathBuf>,
+    /// Referral code whose users we track (e.g. "HYBRIDGE"). Case-insensitive.
+    pub track_referral_code: String,
+    /// Builder address whose fills we track (0x-prefixed hex).
+    pub track_builder_address: String,
+    /// Fraction of a referee's gross fee paid out to us as referral reward
+    /// (e.g. 0.10 = 10%). Confirm against current Hyperliquid referral terms.
+    pub referral_reward_rate: f64,
 }

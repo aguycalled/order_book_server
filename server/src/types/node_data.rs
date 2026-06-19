@@ -98,4 +98,8 @@ impl<E> Batch<E> {
     pub(crate) fn events(self) -> Vec<E> {
         self.events
     }
+
+    pub(crate) fn events_ref(&self) -> &[E] {
+        &self.events
+    }
 }

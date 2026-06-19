@@ -13,7 +13,7 @@ use super::{AssetMeta, DexState, Leverage, LiquidationState, MarginTier, Positio
 
 /// (unused — kept for ad-hoc debugging of the RMP binary structure)
 #[allow(dead_code)]
-fn probe_book_structure(path: &Path) -> Result<()> {
+pub fn probe_book_structure(path: &Path) -> Result<()> {
     let data = fs::read(path)?;
     let mut cur = &data[..];
 
@@ -140,13 +140,23 @@ fn probe_book_structure(path: &Path) -> Result<()> {
                                             let vb = cur[0];
                                             print!("          {ck}=");
                                             match vb {
-                                                0xc2 => { println!("false"); skip_value(&mut cur)?; }
-                                                0xc3 => { println!("true"); skip_value(&mut cur)?; }
+                                                0xc2 => {
+                                                    println!("false");
+                                                    skip_value(&mut cur)?;
+                                                }
+                                                0xc3 => {
+                                                    println!("true");
+                                                    skip_value(&mut cur)?;
+                                                }
                                                 _ if vb & 0xe0 == 0xa0 || vb == 0xd9 || vb == 0xda || vb == 0xdb => {
                                                     let s = read_str(&mut cur)?;
                                                     println!("{s:?}");
                                                 }
-                                                _ if vb <= 0x7f || (vb >= 0xcc && vb <= 0xcf) || (vb >= 0xd0 && vb <= 0xd3) || vb >= 0xe0 => {
+                                                _ if vb <= 0x7f
+                                                    || (vb >= 0xcc && vb <= 0xcf)
+                                                    || (vb >= 0xd0 && vb <= 0xd3)
+                                                    || vb >= 0xe0 =>
+                                                {
                                                     let v = read_int(&mut cur)?;
                                                     println!("{v}");
                                                 }
@@ -160,13 +170,23 @@ fn probe_book_structure(path: &Path) -> Result<()> {
                                         let vb = cur[0];
                                         print!("        {ok}=");
                                         match vb {
-                                            0xc2 => { println!("false"); skip_value(&mut cur)?; }
-                                            0xc3 => { println!("true"); skip_value(&mut cur)?; }
+                                            0xc2 => {
+                                                println!("false");
+                                                skip_value(&mut cur)?;
+                                            }
+                                            0xc3 => {
+                                                println!("true");
+                                                skip_value(&mut cur)?;
+                                            }
                                             _ if vb & 0xe0 == 0xa0 || vb == 0xd9 || vb == 0xda || vb == 0xdb => {
                                                 let s = read_str(&mut cur)?;
                                                 println!("{s:?}");
                                             }
-                                            _ if vb <= 0x7f || (vb >= 0xcc && vb <= 0xcf) || (vb >= 0xd0 && vb <= 0xd3) || vb >= 0xe0 => {
+                                            _ if vb <= 0x7f
+                                                || (vb >= 0xcc && vb <= 0xcf)
+                                                || (vb >= 0xd0 && vb <= 0xd3)
+                                                || vb >= 0xe0 =>
+                                            {
                                                 let v = read_int(&mut cur)?;
                                                 println!("{v}");
                                             }
@@ -223,6 +243,93 @@ pub fn extract_raw_debug_users_from_rmp(path: &Path, debug_users: &HashSet<Strin
     let data = fs::read(path)?;
     let mut cur = &data[..];
     parse_raw_debug_root(&mut cur, debug_users)
+}
+
+/// Scan `exchange.locus.ftr.referrer_states` for the entry whose `c` field matches
+/// `code` (case-insensitive). Returns the referrer owner address and the list of
+/// users who signed up under that code (lowercased hex with "0x" prefix).
+pub fn extract_referrer_users_by_code(path: &Path, code: &str) -> Result<(Option<String>, HashSet<String>)> {
+    let data = fs::read(path)?;
+    let mut cur = &data[..];
+    map_seek(&mut cur, "exchange")?;
+    let en = read_map_len(&mut cur)?;
+    for _ in 0..en {
+        let ek = read_str_ref(&mut cur)?.to_string();
+        if ek != "locus" {
+            skip_value(&mut cur)?;
+            continue;
+        }
+        let ln = read_map_len(&mut cur)?;
+        for _ in 0..ln {
+            let lk = read_str_ref(&mut cur)?.to_string();
+            if lk != "ftr" {
+                skip_value(&mut cur)?;
+                continue;
+            }
+            let fn_len = read_map_len(&mut cur)?;
+            for _ in 0..fn_len {
+                let fk = read_str_ref(&mut cur)?.to_string();
+                if fk != "referrer_states" {
+                    skip_value(&mut cur)?;
+                    continue;
+                }
+                let n = read_array_len(&mut cur)?;
+                for _ in 0..n {
+                    let pn = read_array_len(&mut cur)?;
+                    if pn < 2 {
+                        for _ in 0..pn {
+                            skip_value(&mut cur)?;
+                        }
+                        continue;
+                    }
+                    let owner = read_str(&mut cur)?.to_lowercase();
+                    let state_raw = capture_subtree(&mut cur)?;
+                    for _ in 2..pn {
+                        skip_value(&mut cur)?;
+                    }
+                    let (entry_code, users) = parse_referrer_entry(&state_raw)?;
+                    if entry_code.eq_ignore_ascii_case(code) {
+                        return Ok((Some(owner), users));
+                    }
+                }
+                return Ok((None, HashSet::new()));
+            }
+        }
+    }
+    Ok((None, HashSet::new()))
+}
+
+fn parse_referrer_entry(raw: &[u8]) -> Result<(String, HashSet<String>)> {
+    let mut cur = raw;
+    let n = read_map_len(&mut cur)?;
+    let mut code = String::new();
+    let mut users: HashSet<String> = HashSet::new();
+    for _ in 0..n {
+        let k = read_str_ref(&mut cur)?.to_string();
+        match k.as_str() {
+            "c" => code = read_str(&mut cur)?,
+            "s" => {
+                let arr_n = read_array_len(&mut cur)?;
+                users.reserve(arr_n as usize);
+                for _ in 0..arr_n {
+                    let pn = read_array_len(&mut cur)?;
+                    if pn < 1 {
+                        for _ in 0..pn {
+                            skip_value(&mut cur)?;
+                        }
+                        continue;
+                    }
+                    let user = read_str(&mut cur)?.to_lowercase();
+                    users.insert(user);
+                    for _ in 1..pn {
+                        skip_value(&mut cur)?;
+                    }
+                }
+            }
+            _ => skip_value(&mut cur)?,
+        }
+    }
+    Ok((code, users))
 }
 
 // ── top-level navigation ───────────────────────────────────────────────────
@@ -287,6 +394,38 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         }
     }
 
+    // Collect all users already known across all dexes.
+    let mut known_users: HashSet<String> = HashSet::new();
+    for dex in &dex_states {
+        known_users.extend(dex.users.keys().cloned());
+        known_users.extend(dex.users_without_positions.keys().cloned());
+    }
+
+    // Users in account_modes or spot_balances who aren't in any dex need a
+    // partial entry on dex 0 so that apply_fill can discover their account
+    // mode and SCL when they first trade on any dex.
+    if let Some(dex0) = dex_states.first_mut() {
+        for (addr, &mode) in &account_modes {
+            if mode == super::AccountMode::Standard {
+                continue;
+            }
+            if known_users.contains(addr) {
+                continue;
+            }
+            known_users.insert(addr.clone());
+            dex0.users_without_positions.insert(
+                addr.clone(),
+                super::UserStatePartial {
+                    usdc_balance: 0,
+                    spot_collateral: 0,
+                    spot_collateral_decimals: 8,
+                    account_mode: mode,
+                    leverage_settings: HashMap::new(),
+                },
+            );
+        }
+    }
+
     // Apply account mode and spot collateral to ALL dex user states
     for dex in &mut dex_states {
         let token_id = dex.collateral_token;
@@ -302,6 +441,38 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
             partial.spot_collateral_decimals = decimals;
             partial.spot_collateral =
                 spot_balances.get(addr).and_then(|tokens| tokens.get(&token_id)).copied().unwrap_or(0);
+        }
+    }
+
+    // Ensure users with spot balances for a collateral token exist on at least
+    // one dex with that token. Otherwise their SCL is invisible when they first
+    // trade on that dex.
+    for (addr, tokens) in &spot_balances {
+        for (&token_id, &balance) in tokens {
+            if balance == 0 {
+                continue;
+            }
+            // Check if user already exists on any dex with this collateral token
+            let exists = dex_states.iter().any(|d| {
+                d.collateral_token == token_id
+                    && (d.users.contains_key(addr.as_str()) || d.users_without_positions.contains_key(addr.as_str()))
+            });
+            if !exists {
+                // Find the first dex with this token and create a partial entry
+                if let Some(dex) = dex_states.iter_mut().find(|d| d.collateral_token == token_id) {
+                    let mode = account_modes.get(addr).copied().unwrap_or(super::AccountMode::Standard);
+                    dex.users_without_positions.insert(
+                        addr.clone(),
+                        super::UserStatePartial {
+                            usdc_balance: 0,
+                            spot_collateral: balance,
+                            spot_collateral_decimals: 8,
+                            account_mode: mode,
+                            leverage_settings: HashMap::new(),
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -347,10 +518,25 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
     let users_with_perp_positions: HashSet<String> =
         dex_states.iter().flat_map(|dex| dex.users.keys().cloned()).collect();
 
+    // Seed mark prices from snapshot oracle prices so isolated margin
+    // calculations use the correct price from the very first fill.
+    let mut initial_mark_prices: HashMap<(usize, u32), f64> = HashMap::new();
+    for (di, dex) in dex_states.iter().enumerate() {
+        for (ai, &oracle_px_raw) in dex.oracle_prices.iter().enumerate() {
+            if oracle_px_raw == 0 {
+                continue;
+            }
+            let sz_dec = dex.universe.get(ai).map(|a| a.sz_decimals).unwrap_or(0);
+            let px = oracle_px_raw as f64 / 10f64.powi(6i32 - sz_dec as i32);
+            initial_mark_prices.insert((di, ai as u32), px);
+        }
+    }
+
     Ok(LiquidationState {
         dex_states,
         coin_to_dex_asset,
         processed_withdrawal_nonces: HashSet::new(),
+        processed_vault_withdrawals: HashSet::new(),
         debug_users: HashSet::new(),
         positions_needing_leverage_fix: Vec::new(),
         event_log: None,
@@ -360,7 +546,7 @@ fn parse_root(cur: &mut &[u8]) -> Result<LiquidationState> {
         borrow_lend_states,
         portfolio_margin_users,
         vault_states,
-        mark_prices: HashMap::new(),
+        mark_prices: initial_mark_prices,
         order_holds: HashMap::new(),
         spot_pairs: HashMap::new(),
         dex_name_to_pdi: dex_name_map,
@@ -739,9 +925,7 @@ fn fixup_default_leverage(
                         .map(|t| t.max_leverage.min(20))
                         .unwrap_or(mt_id.min(20))
                 };
-                let isolated_default = meta
-                    .map(|m| m.margin_mode != super::MarginMode::Normal)
-                    .unwrap_or(is_hip3);
+                let isolated_default = meta.map(|m| m.margin_mode != super::MarginMode::Normal).unwrap_or(is_hip3);
                 pos.leverage = if isolated_default {
                     Leverage::Isolated { leverage: max_lev, raw_usd: 0 }
                 } else {
@@ -763,9 +947,7 @@ fn fixup_default_leverage(
                         .map(|t| t.max_leverage.min(20))
                         .unwrap_or(mt_id.min(20))
                 };
-                let isolated_default = meta
-                    .map(|m| m.margin_mode != super::MarginMode::Normal)
-                    .unwrap_or(is_hip3);
+                let isolated_default = meta.map(|m| m.margin_mode != super::MarginMode::Normal).unwrap_or(is_hip3);
                 *lev = if isolated_default {
                     Leverage::Isolated { leverage: max_lev, raw_usd: 0 }
                 } else {
@@ -1176,7 +1358,9 @@ fn parse_blp_users(cur: &mut &[u8]) -> Result<HashMap<(String, u32), super::Borr
             for _ in 0..arr_len {
                 let pair_len = read_array_len(cur)?;
                 if pair_len < 2 {
-                    for _ in 0..pair_len { skip_value(cur)?; }
+                    for _ in 0..pair_len {
+                        skip_value(cur)?;
+                    }
                     continue;
                 }
                 let addr = read_str(cur)?.to_lowercase();
@@ -1190,7 +1374,9 @@ fn parse_blp_users(cur: &mut &[u8]) -> Result<HashMap<(String, u32), super::Borr
                             // Each: [token_id, [supply_map, borrow_map]]
                             let tpair_len = read_array_len(cur)?;
                             if tpair_len < 2 {
-                                for _ in 0..tpair_len { skip_value(cur)?; }
+                                for _ in 0..tpair_len {
+                                    skip_value(cur)?;
+                                }
                                 continue;
                             }
                             let token_id = read_int(cur)? as u32;
@@ -1224,19 +1410,26 @@ fn parse_blp_users(cur: &mut &[u8]) -> Result<HashMap<(String, u32), super::Borr
                                     }
                                 }
                             }
-                            for _ in 2..inner_len { skip_value(cur)?; }
-                            for _ in 2..tpair_len { skip_value(cur)?; }
+                            for _ in 2..inner_len {
+                                skip_value(cur)?;
+                            }
+                            for _ in 2..tpair_len {
+                                skip_value(cur)?;
+                            }
                             if borrowed != 0 || supplied != 0 {
-                                result.insert((addr.clone(), token_id), super::BorrowLendState {
-                                    borrowed, borrow_shares, supplied, supply_shares,
-                                });
+                                result.insert(
+                                    (addr.clone(), token_id),
+                                    super::BorrowLendState { borrowed, borrow_shares, supplied, supply_shares },
+                                );
                             }
                         }
                     } else {
                         skip_value(cur)?;
                     }
                 }
-                for _ in 2..pair_len { skip_value(cur)?; }
+                for _ in 2..pair_len {
+                    skip_value(cur)?;
+                }
             }
         } else {
             skip_value(cur)?;
@@ -1256,7 +1449,9 @@ fn parse_vlt(cur: &mut &[u8]) -> Result<HashMap<String, super::VaultState>> {
     for _ in 0..arr_len {
         let pair_len = read_array_len(cur)?;
         if pair_len < 2 {
-            for _ in 0..pair_len { skip_value(cur)?; }
+            for _ in 0..pair_len {
+                skip_value(cur)?;
+            }
             continue;
         }
         let vault_addr = read_str(cur)?.to_lowercase();
@@ -1270,7 +1465,9 @@ fn parse_vlt(cur: &mut &[u8]) -> Result<HashMap<String, super::VaultState>> {
                 for _ in 0..us_len {
                     let us_pair = read_array_len(cur)?;
                     if us_pair < 2 {
-                        for _ in 0..us_pair { skip_value(cur)?; }
+                        for _ in 0..us_pair {
+                            skip_value(cur)?;
+                        }
                         continue;
                     }
                     let user_addr = read_str(cur)?.to_lowercase();
@@ -1294,7 +1491,9 @@ fn parse_vlt(cur: &mut &[u8]) -> Result<HashMap<String, super::VaultState>> {
                             skip_value(cur)?;
                         }
                     }
-                    for _ in 2..us_pair { skip_value(cur)?; }
+                    for _ in 2..us_pair {
+                        skip_value(cur)?;
+                    }
                     if fraction > 0.0 {
                         user_ownership.insert(user_addr, fraction);
                     }
@@ -1303,7 +1502,9 @@ fn parse_vlt(cur: &mut &[u8]) -> Result<HashMap<String, super::VaultState>> {
                 skip_value(cur)?;
             }
         }
-        for _ in 2..pair_len { skip_value(cur)?; }
+        for _ in 2..pair_len {
+            skip_value(cur)?;
+        }
         if !user_ownership.is_empty() {
             result.insert(vault_addr, super::VaultState { user_ownership });
         }

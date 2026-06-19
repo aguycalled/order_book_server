@@ -1,4 +1,5 @@
 pub mod api_leverage;
+pub mod liquidation_map;
 pub mod misc_events;
 pub mod replica;
 pub mod rmp_streaming;
@@ -32,6 +33,18 @@ impl AccountMode {
     /// Whether this mode shares USDC across dexes (for balance comparison).
     pub fn is_shared_usdc(&self) -> bool {
         matches!(self, AccountMode::Unified | AccountMode::DexAbstraction)
+    }
+
+    /// Whether balance changes should go to SCL for the given collateral token.
+    /// - Unified: always SCL
+    /// - DexAbstraction: SCL only for non-USDC collateral tokens; USDC → usdc_balance
+    /// - Standard/PortfolioMargin: never SCL
+    pub fn routes_to_scl(&self, collateral_token: u32) -> bool {
+        match self {
+            AccountMode::Unified => true,
+            AccountMode::DexAbstraction => collateral_token != 0,
+            _ => false,
+        }
     }
 }
 
@@ -131,6 +144,10 @@ pub struct LiquidationState {
     /// Track processed withdrawal nonces to avoid double-counting
     /// (multiple validators vote on the same withdrawal).
     pub processed_withdrawal_nonces: std::collections::HashSet<i64>,
+    /// Track vault withdrawals with exact amounts (usd>0) from replica,
+    /// so misc events can skip them to avoid double-counting.
+    /// Key = (vault_addr, user_addr).
+    pub processed_vault_withdrawals: std::collections::HashSet<(String, String)>,
     /// Users to trace for debugging. All state changes are logged.
     pub debug_users: std::collections::HashSet<String>,
     /// Users who opened positions with default leverage (no snapshot data).
@@ -267,7 +284,8 @@ impl LiquidationState {
     }
 
     /// Compute vault withdrawal amount when `usd=0` (withdraw all).
-    /// Returns the user's share of the vault's usdc_balance in 6-decimal micro USD.
+    /// Returns the user's share of the vault's total equity in 6-decimal micro USD.
+    /// Vault equity = sum(usdc_balance + spot_collateral/100 + unrealized_pnl) across all dexes.
     pub fn compute_vault_withdrawal(&self, vault_addr: &str, user_addr: &str) -> i64 {
         let vault = vault_addr.to_lowercase();
         let user = user_addr.to_lowercase();
@@ -279,24 +297,53 @@ impl LiquidationState {
             return 0;
         }
 
-        // TODO: Full vault equity requires oracle prices (format TBD).
-        // For now, use usdc_balance only — this underestimates for vaults with positions.
-        let mut vault_usdc: i64 = 0;
-        for dex in &self.dex_states {
+        // Compute vault total equity: balance + spot collateral + unrealized PnL from positions.
+        let mut vault_equity: i64 = 0;
+        for (dex_idx, dex) in self.dex_states.iter().enumerate() {
             if let Some(vs) = dex.users.get(&vault) {
-                vault_usdc += vs.usdc_balance;
+                vault_equity += vs.usdc_balance;
+                vault_equity += vs.spot_collateral / 100; // 8→6 dec
+                // Add position equity using mark prices.
+                for (&asset_idx, pos) in &vs.positions {
+                    match &pos.leverage {
+                        Leverage::Isolated { raw_usd, .. } => {
+                            // Isolated: raw_usd is self-contained (margin + PnL).
+                            // Position value at mark = raw_usd + (mark_notional - cost_basis).
+                            if let Some(&mpx) = self.mark_prices.get(&(dex_idx, asset_idx)) {
+                                let sz_dec = dex.universe.get(asset_idx as usize).map(|a| a.sz_decimals).unwrap_or(0);
+                                let position_sz = pos.szi as f64 / 10f64.powi(sz_dec as i32);
+                                let mark_notional = (position_sz * mpx * 1e6).round() as i64;
+                                let upnl = mark_notional - pos.cost_basis;
+                                vault_equity += raw_usd + upnl;
+                            } else {
+                                // No mark price — use raw_usd as-is (conservative)
+                                vault_equity += raw_usd;
+                            }
+                        }
+                        Leverage::Cross(_) => {
+                            // Cross: unrealized PnL = mark_notional - cost_basis
+                            if let Some(&mpx) = self.mark_prices.get(&(dex_idx, asset_idx)) {
+                                let sz_dec = dex.universe.get(asset_idx as usize).map(|a| a.sz_decimals).unwrap_or(0);
+                                let position_sz = pos.szi as f64 / 10f64.powi(sz_dec as i32);
+                                let mark_notional = (position_sz * mpx * 1e6).round() as i64;
+                                let upnl = mark_notional - pos.cost_basis;
+                                vault_equity += upnl;
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        let withdrawal = (vault_usdc as f64 * fraction).round() as i64;
+        let withdrawal = (vault_equity as f64 * fraction).round() as i64;
 
         if self.debug_users.contains(&vault) || self.debug_users.contains(&user) {
             eprintln!(
-                "[DEBUG vault_withdrawal] vault={} user={} fraction={:.6} vault_usdc=${:.2} withdrawal=${:.2}",
+                "[DEBUG vault_withdrawal] vault={} user={} fraction={:.6} vault_equity=${:.2} withdrawal=${:.2}",
                 vault,
                 user,
                 fraction,
-                vault_usdc as f64 / 1e6,
+                vault_equity as f64 / 1e6,
                 withdrawal as f64 / 1e6
             );
         }
@@ -340,7 +387,12 @@ impl LiquidationState {
                 }
                 if total_settled != 0 {
                     if self.debug_users.contains(addr) {
-                        eprintln!("[DEBUG settle_funding] user={} settled=${:.2}", addr, total_settled as f64 / 1e6);
+                        eprintln!(
+                            "[DEBUG settle_funding] user={} settled=${:.2} mode={:?}",
+                            addr,
+                            total_settled as f64 / 1e6,
+                            user_state.account_mode
+                        );
                     }
                     user_state.usdc_balance += total_settled;
                 }
@@ -1254,6 +1306,7 @@ mod tests {
             }],
             coin_to_dex_asset: HashMap::from([("BTC".to_string(), (0, 0))]),
             processed_withdrawal_nonces: std::collections::HashSet::new(),
+            processed_vault_withdrawals: std::collections::HashSet::new(),
             debug_users: std::collections::HashSet::new(),
             positions_needing_leverage_fix: Vec::new(),
             event_log: None,

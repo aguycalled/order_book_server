@@ -111,8 +111,16 @@ fn flatten_with_children(pair: (Address, L4Order)) -> Vec<(Address, L4Order)> {
                     static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let c = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if c < 10 {
-                        log::info!("HIP3 trigger child: coin={} side={:?} is_trigger={} order_type={} trigger_px={} limit_px={} sz={}",
-                            child.coin, child.side, child.is_trigger, child.order_type, child.trigger_px, child.limit_px, child.sz);
+                        log::info!(
+                            "HIP3 trigger child: coin={} side={:?} is_trigger={} order_type={} trigger_px={} limit_px={} sz={}",
+                            child.coin,
+                            child.side,
+                            child.is_trigger,
+                            child.order_type,
+                            child.trigger_px,
+                            child.limit_px,
+                            child.sz
+                        );
                     }
                 }
                 child.user = Some(addr);
@@ -151,7 +159,10 @@ where
 }
 
 /// Like `load_snapshots_from_cli_str` but also extracts trigger orders from children.
-pub(crate) fn load_snapshots_with_children(str: &str, height: u64) -> Result<(u64, Snapshots<crate::types::inner::InnerL4Order>)> {
+pub(crate) fn load_snapshots_with_children(
+    str: &str,
+    height: u64,
+) -> Result<(u64, Snapshots<crate::types::inner::InnerL4Order>)> {
     #[allow(clippy::type_complexity)]
     let snapshot: Vec<(String, [Vec<(Address, L4Order)>; 2])> = serde_json::from_str(str)?;
     Ok((
@@ -160,11 +171,13 @@ pub(crate) fn load_snapshots_with_children(str: &str, height: u64) -> Result<(u6
             snapshot
                 .into_iter()
                 .map(|(coin, [bids, asks])| {
-                    let bids = bids.into_iter()
+                    let bids = bids
+                        .into_iter()
                         .flat_map(flatten_with_children)
                         .map(crate::types::inner::InnerL4Order::try_from)
                         .collect::<Result<Vec<_>>>()?;
-                    let asks = asks.into_iter()
+                    let asks = asks
+                        .into_iter()
                         .flat_map(flatten_with_children)
                         .map(crate::types::inner::InnerL4Order::try_from)
                         .collect::<Result<Vec<_>>>()?;

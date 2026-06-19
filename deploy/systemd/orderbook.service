@@ -1,0 +1,31 @@
+[Unit]
+Description=order_book_server_v2 (Hyperliquid order book server)
+# Coordinator gates start/stop; this ordering is best-effort only.
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alex/order_book_server_v2
+# Block until hl-node is alive and caught up for the grace period, so we never
+# grab the data dir while hl-node is mid-restart after a network upgrade.
+ExecStartPre=/home/alex/bin/wait_hl_ready.sh
+ExecStart=/home/alex/order_book_server_v2/target/release/orderbook_server \
+    --snapshot-mode direct \
+    --hlnode-binary /home/alex/hl-node \
+    --data-dir /home/alex/hl/data \
+    --abci-state-path /home/alex/hl/hyperliquid_data/abci_state.rmp \
+    --build-liquidation-map
+# orderbook handles SIGTERM as a clean shutdown; repair-on-open recovers its
+# RocksDBs from any unclean death as a safety net.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+# Auto-restart on crash; the coordinator's explicit `stop` stays stopped.
+Restart=on-failure
+RestartSec=10
+# wait_hl_ready can block a long time; don't let systemd time out the start.
+TimeoutStartSec=infinity
+StandardOutput=append:/home/alex/logs/orderbook_service.log
+StandardError=append:/home/alex/logs/orderbook_service.log
+
+[Install]
+WantedBy=default.target

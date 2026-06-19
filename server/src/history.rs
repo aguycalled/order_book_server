@@ -22,7 +22,7 @@ impl L2History {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let db = DB::open(&opts, path)?;
+        let db = crate::open_db_with_repair(&opts, &path)?;
         Ok(Self { db })
     }
 

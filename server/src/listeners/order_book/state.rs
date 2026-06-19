@@ -25,6 +25,12 @@ pub(super) struct OrderBookState {
     // Persistent cache of New diffs (sz values) waiting for their OrderStatuses
     // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
     pending_new_diffs: HashMap<Oid, crate::order_book::types::Sz>,
+    // Tombstones for oids whose Remove diff arrived before the New+Status pair was
+    // resolved. Without this, a reduce-only stop-limit that fires and immediately
+    // fills as taker leaks a phantom resting order: the parallel file watchers
+    // deliver Remove before New, cancel_order returns false, and the later
+    // New+Status pair re-adds the already-dead order.
+    pending_removals: HashSet<Oid>,
 }
 
 impl OrderBookState {
@@ -43,6 +49,7 @@ impl OrderBookState {
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: HashMap::new(),
             pending_new_diffs: HashMap::new(),
+            pending_removals: HashSet::new(),
         }
     }
 
@@ -103,9 +110,14 @@ impl OrderBookState {
         self.pending_order_statuses.len()
     }
 
-    /// Count of OrderDiff::New sizes waiting for their OrderStatus to arrive  
+    /// Count of OrderDiff::New sizes waiting for their OrderStatus to arrive
     pub(super) fn pending_new_diffs_count(&self) -> usize {
         self.pending_new_diffs.len()
+    }
+
+    /// Count of tombstoned oids whose Remove arrived before New+Status pairing.
+    pub(super) fn pending_removals_count(&self) -> usize {
+        self.pending_removals.len()
     }
 
     /// Total number of orders currently in the orderbook
@@ -125,6 +137,11 @@ impl OrderBookState {
     pub(super) fn cleanup_stale_pending(&mut self) {
         const MAX_PENDING_ORDERS: usize = 10_000;
         const MAX_PENDING_DIFFS: usize = 1_000;
+        // Tombstones persist indefinitely (OIDs aren't reused), so the cap is about
+        // memory, not correctness. An order finishing its out-of-order race within a
+        // few blocks means the tombstone is stale within milliseconds; size 100k
+        // bounds memory at a few MB while comfortably outlasting any real race.
+        const MAX_PENDING_REMOVALS: usize = 100_000;
 
         // Clear oldest entries by just clearing the entire cache when too large
         // This is simpler than tracking insertion order
@@ -139,6 +156,11 @@ impl OrderBookState {
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
             log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
             self.pending_new_diffs.clear();
+        }
+
+        if self.pending_removals.len() > MAX_PENDING_REMOVALS {
+            log::warn!("Clearing stale pending_removals tombstones: {} entries", self.pending_removals.len());
+            self.pending_removals.clear();
         }
     }
 
@@ -170,6 +192,11 @@ impl OrderBookState {
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
 
+            // If Remove for this oid already arrived out-of-order, don't resurrect it.
+            if self.pending_removals.contains(&oid) {
+                continue;
+            }
+
             // Remove trigger order from book when status changes away from open
             if order_status.order.is_trigger && order_status.status != "open" {
                 let coin = Coin::new(&order_status.order.coin);
@@ -178,7 +205,12 @@ impl OrderBookState {
                     static TRIG_RM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let c = TRIG_RM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if c < 20 {
-                        log::info!("Trigger removed: oid={} coin={} status={}", order_status.order.oid, order_status.order.coin, order_status.status);
+                        log::info!(
+                            "Trigger removed: oid={} coin={} status={}",
+                            order_status.order.oid,
+                            order_status.order.coin,
+                            order_status.status
+                        );
                     }
                     if c % 1000 == 0 {
                         log::info!("Trigger removals total: {c}");
@@ -201,8 +233,10 @@ impl OrderBookState {
                 self.order_book.add_order(inner_order);
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
-            } else if order_status.order.is_trigger && order_status.status == "open"
-                && (order_status.order.order_type.contains("market") || order_status.order.order_type.contains("Market"))
+            } else if order_status.order.is_trigger
+                && order_status.status == "open"
+                && (order_status.order.order_type.contains("market")
+                    || order_status.order.order_type.contains("Market"))
             {
                 // Open market trigger orders (stop market, TP market) don't get New diffs.
                 // Insert directly without matching — these should sit passively in the book.
@@ -233,6 +267,10 @@ impl OrderBookState {
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
+                    // If Remove already arrived out-of-order, drop this New on the floor.
+                    if self.pending_removals.contains(&oid) {
+                        continue;
+                    }
                     // Check if OrderStatus already arrived
                     if let Some(order) = self.pending_order_statuses.remove(&oid) {
                         // Both arrived - add order immediately!
@@ -258,6 +296,12 @@ impl OrderBookState {
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
+                    // Clear any pending halves and tombstone the oid so a late-arriving
+                    // New+Status pair (delivered from a different file watcher) doesn't
+                    // resurrect this order.
+                    self.pending_new_diffs.remove(&oid);
+                    self.pending_order_statuses.remove(&oid);
+                    self.pending_removals.insert(oid.clone());
                     let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
                     changed_coins.insert(coin);
                 }

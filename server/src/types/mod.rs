@@ -11,15 +11,25 @@ pub(crate) mod node_data;
 pub(crate) mod subscription;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Trade {
     pub coin: String,
+    /// Aggressor side ("B" = buyer crossed, "A" = seller crossed).
     side: Side,
     px: String,
     sz: String,
     hash: String,
     time: u64,
     tid: u64,
-    user: Address,
+    /// [buyer, seller] — matches the Hyperliquid `trades` wire format so the UI
+    /// can resolve taker/maker from `side`. A trade is two fills sharing a tid.
+    users: [Address; 2],
+    /// [buyer, seller] fill direction, e.g. "Open Long" / "Close Short" / "Buy".
+    /// Lets the UI show whether each side is opening/closing a long/short.
+    dirs: [String; 2],
+    /// [buyer, seller] signed position size BEFORE this fill (from the node).
+    /// Combined with `dir` + `sz` the UI can show positioning. Notional is px*sz.
+    start_positions: [String; 2],
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -142,19 +152,51 @@ impl L2Book {
 }
 
 impl Trade {
-    /// Create a trade from a single fill (raw broadcast without pairing)
-    pub(crate) fn from_single_fill(fill: NodeDataFill) -> Self {
-        let NodeDataFill(user, fill_data) = fill;
-        Self {
-            coin: fill_data.coin,
-            side: fill_data.side,
-            px: fill_data.px,
-            sz: fill_data.sz,
-            hash: fill_data.hash,
-            time: fill_data.time,
-            tid: fill_data.tid,
-            user,
+    /// Build one trade from the fills sharing a tid (taker + maker, same block).
+    /// `users`/`dirs`/`start_positions` are ordered [buyer, seller]; `side` is the
+    /// aggressor's side (the `crossed` fill). Missing side → zero address.
+    pub(crate) fn from_fill_group(group: &[NodeDataFill]) -> Option<Self> {
+        let mut buyer = Address::ZERO;
+        let mut seller = Address::ZERO;
+        let mut buyer_dir = String::new();
+        let mut seller_dir = String::new();
+        let mut buyer_sp = String::new();
+        let mut seller_sp = String::new();
+        let mut taker_side: Option<Side> = None;
+        let mut rep: Option<&Fill> = None;
+
+        for NodeDataFill(user, f) in group {
+            rep = Some(f);
+            match f.side {
+                Side::Bid => {
+                    buyer = *user;
+                    buyer_dir = f.dir.clone();
+                    buyer_sp = f.start_position.clone();
+                }
+                Side::Ask => {
+                    seller = *user;
+                    seller_dir = f.dir.clone();
+                    seller_sp = f.start_position.clone();
+                }
+            }
+            if f.crossed {
+                taker_side = Some(f.side);
+            }
         }
+
+        let f = rep?;
+        Some(Self {
+            coin: f.coin.clone(),
+            side: taker_side.unwrap_or(f.side),
+            px: f.px.clone(),
+            sz: f.sz.clone(),
+            hash: f.hash.clone(),
+            time: f.time,
+            tid: f.tid,
+            users: [buyer, seller],
+            dirs: [buyer_dir, seller_dir],
+            start_positions: [buyer_sp, seller_sp],
+        })
     }
 
     pub(crate) fn px(&self) -> &str {
@@ -240,6 +282,14 @@ pub(crate) struct Fill {
     #[serde(default)]
     pub twap_id: Option<u64>,
     pub liquidation: Option<Liquidation>,
+    /// Builder address credited on this fill (HIP-3 / builder-code orders).
+    /// Present directly on the fill — no order-status cache needed.
+    #[serde(default)]
+    pub builder: Option<String>,
+    /// Exact builder fee we earned on this fill, quote-denominated decimal
+    /// string (e.g. "0.003537"). Authoritative — no `notional × f` estimate.
+    #[serde(default)]
+    pub builder_fee: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,4 +298,46 @@ pub(crate) struct Liquidation {
     pub liquidated_user: String,
     pub mark_px: String,
     pub method: String,
+}
+
+// ── Liquidation map types ───────────────────────────────────────────────
+
+/// L2-style aggregated liquidation heatmap: price buckets with total size/count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidationMapData {
+    pub coin: String,
+    pub time: u64,
+    /// [longs_liquidated (below mark), shorts_liquidated (above mark)]
+    pub levels: [Vec<LiquidationLevel>; 2],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidationLevel {
+    pub px: String,
+    pub coin_sz: String,
+    pub ntl_sz: String,
+    pub n: usize,
+}
+
+/// L4 per-user liquidation detail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct L4LiquidationMapData {
+    pub coin: String,
+    pub time: u64,
+    pub positions: Vec<L4LiquidationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct L4LiquidationEntry {
+    pub user: String,
+    pub side: String,
+    pub sz: String,
+    pub entry_px: String,
+    pub liq_px: String,
+    pub leverage: String,
+    pub margin_type: String,
 }

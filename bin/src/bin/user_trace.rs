@@ -137,13 +137,21 @@ fn print_user_state(state: &LiquidationState, user: &str) {
         if let Some(us) = dex.users.get(user) {
             found = true;
             println!("  dex[{}] pdi={} (users):", di, dex.pdi);
-            println!("    usdc=${:.2} scl={} mode={:?}", us.usdc_balance as f64 / 1e6, us.spot_collateral, us.account_mode);
+            println!(
+                "    usdc=${:.2} scl={} mode={:?}",
+                us.usdc_balance as f64 / 1e6,
+                us.spot_collateral,
+                us.account_mode
+            );
             let mut keys: Vec<_> = us.positions.keys().collect();
             keys.sort();
             for &k in &keys {
                 let p = &us.positions[k];
                 let coin = dex.universe.get(*k as usize).map(|a| a.name.as_str()).unwrap_or("?");
-                println!("    pos[{}] {}: szi={} cb={} lev={:?} funding={}", k, coin, p.szi, p.cost_basis, p.leverage, p.outstanding_funding);
+                println!(
+                    "    pos[{}] {}: szi={} cb={} lev={:?} funding={}",
+                    k, coin, p.szi, p.cost_basis, p.leverage, p.outstanding_funding
+                );
             }
             let mut lkeys: Vec<_> = us.leverage_settings.keys().filter(|k| !us.positions.contains_key(*k)).collect();
             lkeys.sort();
@@ -156,7 +164,12 @@ fn print_user_state(state: &LiquidationState, user: &str) {
         if let Some(partial) = dex.users_without_positions.get(user) {
             found = true;
             println!("  dex[{}] pdi={} (partial):", di, dex.pdi);
-            println!("    usdc=${:.2} scl={} mode={:?}", partial.usdc_balance as f64 / 1e6, partial.spot_collateral, partial.account_mode);
+            println!(
+                "    usdc=${:.2} scl={} mode={:?}",
+                partial.usdc_balance as f64 / 1e6,
+                partial.spot_collateral,
+                partial.account_mode
+            );
             let mut lkeys: Vec<_> = partial.leverage_settings.keys().collect();
             lkeys.sort();
             for &k in &lkeys {
@@ -175,7 +188,9 @@ fn print_user_state(state: &LiquidationState, user: &str) {
 
 fn collect_fills(data_dir: &Path, user: &str, from_block: u64, to_block: u64, events: &mut BTreeMap<u64, Vec<Event>>) {
     let fills_dir = data_dir.join("node_fills_streaming");
-    if !fills_dir.exists() { return; }
+    if !fills_dir.exists() {
+        return;
+    }
 
     let mut files = Vec::new();
     collect_files_recursive(&fills_dir, &mut files);
@@ -186,17 +201,25 @@ fn collect_fills(data_dir: &Path, user: &str, from_block: u64, to_block: u64, ev
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            if !line.contains(user) { continue; }
+            if !line.contains(user) {
+                continue;
+            }
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             let bn = val.get("block_number").and_then(|v| v.as_u64()).unwrap_or(0);
-            if bn <= from_block || bn > to_block { continue; }
+            if bn <= from_block || bn > to_block {
+                continue;
+            }
 
             let Some(evts) = val.get("events").and_then(|v| v.as_array()) else { continue };
             for ev in evts {
                 let Some(arr) = ev.as_array() else { continue };
-                if arr.len() < 2 { continue; }
+                if arr.len() < 2 {
+                    continue;
+                }
                 let ev_user = arr[0].as_str().unwrap_or("").to_lowercase();
-                if ev_user != user { continue; }
+                if ev_user != user {
+                    continue;
+                }
 
                 let fill = &arr[1];
                 let coin = fill.get("coin").and_then(|v| v.as_str()).unwrap_or("?");
@@ -211,7 +234,18 @@ fn collect_fills(data_dir: &Path, user: &str, from_block: u64, to_block: u64, ev
                 events.entry(bn).or_default().push(Event {
                     block: bn,
                     source: "fill",
-                    summary: format!("{} {} {} sz={} px={} startPos={} fee={} dir={} closedPnl={}", coin, side_name(side), dir, sz, px, start_pos, fee, dir, closed_pnl),
+                    summary: format!(
+                        "{} {} {} sz={} px={} startPos={} fee={} dir={} closedPnl={}",
+                        coin,
+                        side_name(side),
+                        dir,
+                        sz,
+                        px,
+                        start_pos,
+                        fee,
+                        dir,
+                        closed_pnl
+                    ),
                     detail: String::new(),
                 });
             }
@@ -229,9 +263,17 @@ fn side_name(s: &str) -> &str {
 
 // ── Replica collector ────────────────────────────────────────────────────
 
-fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, events: &mut BTreeMap<u64, Vec<Event>>) {
+fn collect_replica(
+    home_dir: &Path,
+    user: &str,
+    from_block: u64,
+    to_block: u64,
+    events: &mut BTreeMap<u64, Vec<Event>>,
+) {
     let replica_dir = home_dir.join("hl/data/replica_cmds");
-    if !replica_dir.exists() { return; }
+    if !replica_dir.exists() {
+        return;
+    }
 
     let mut files = Vec::new();
     collect_files_recursive(&replica_dir, &mut files);
@@ -241,7 +283,9 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
         // Filter by filename (block number)
         let file_block: Option<u64> = path.file_name().and_then(|s| s.to_str()).and_then(|s| s.parse().ok());
         if let Some(fb) = file_block {
-            if fb > to_block || fb + 10_000 <= from_block { continue; }
+            if fb > to_block || fb + 10_000 <= from_block {
+                continue;
+            }
         }
 
         let Ok(file) = std::fs::File::open(path) else { continue };
@@ -250,9 +294,13 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
 
         for (line_idx, line) in reader.lines().enumerate() {
             let Ok(line) = line else { break };
-            if !line.to_lowercase().contains(user) { continue; }
+            if !line.to_lowercase().contains(user) {
+                continue;
+            }
             let block_num = base_block + line_idx as u64;
-            if block_num <= from_block || block_num > to_block { continue; }
+            if block_num <= from_block || block_num > to_block {
+                continue;
+            }
 
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
 
@@ -263,10 +311,14 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
             let resp_bundles: Vec<Option<&Vec<serde_json::Value>>> = match resps {
                 Some(serde_json::Value::Object(obj)) => {
                     if let Some(serde_json::Value::Array(full)) = obj.get("Full") {
-                        full.iter().map(|entry| {
-                            entry.as_array().and_then(|a| if a.len() >= 2 { a[1].as_array() } else { None })
-                        }).collect()
-                    } else { Vec::new() }
+                        full.iter()
+                            .map(|entry| {
+                                entry.as_array().and_then(|a| if a.len() >= 2 { a[1].as_array() } else { None })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
                 }
                 _ => Vec::new(),
             };
@@ -274,11 +326,15 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
             if let Some(bundles) = bundles {
                 for (bi, bundle) in bundles.iter().enumerate() {
                     let Some(arr) = bundle.as_array() else { continue };
-                    if arr.len() < 2 { continue; }
+                    if arr.len() < 2 {
+                        continue;
+                    }
                     let signer = arr[0].as_str().unwrap_or("").to_lowercase();
 
                     let Some(action_bundle) = arr[1].as_object() else { continue };
-                    let Some(signed_actions) = action_bundle.get("signed_actions").and_then(|v| v.as_array()) else { continue };
+                    let Some(signed_actions) = action_bundle.get("signed_actions").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
 
                     let bundle_resps = resp_bundles.get(bi).and_then(|r| r.as_ref());
 
@@ -301,7 +357,9 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
                             .map(|s| s.to_lowercase());
                         let is_in_resp = resp_user.as_deref() == Some(user);
 
-                        if !is_signer && !is_vault && !is_in_action && !is_in_resp { continue; }
+                        if !is_signer && !is_vault && !is_in_action && !is_in_resp {
+                            continue;
+                        }
 
                         // Skip pure order/cancel unless user is signer
                         if matches!(atype, "order" | "cancel" | "cancelByCloid" | "batchModify") && !is_signer {
@@ -315,17 +373,28 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
                             .and_then(|v| v.as_str())
                             .unwrap_or("ok");
 
-                        let role = if is_signer { "signer" }
-                            else if is_vault { "vaultAddr" }
-                            else if is_in_resp { "resp_user" }
-                            else { "referenced" };
+                        let role = if is_signer {
+                            "signer"
+                        } else if is_vault {
+                            "vaultAddr"
+                        } else if is_in_resp {
+                            "resp_user"
+                        } else {
+                            "referenced"
+                        };
 
                         let detail = serde_json::to_string_pretty(action).unwrap_or_default();
 
                         events.entry(block_num).or_default().push(Event {
                             block: block_num,
                             source: "replica",
-                            summary: format!("type={} role={} signer={}.. status={}", atype, role, &signer[..14.min(signer.len())], resp_status),
+                            summary: format!(
+                                "type={} role={} signer={}.. status={}",
+                                atype,
+                                role,
+                                &signer[..14.min(signer.len())],
+                                resp_status
+                            ),
                             detail,
                         });
                     }
@@ -337,9 +406,17 @@ fn collect_replica(home_dir: &Path, user: &str, from_block: u64, to_block: u64, 
 
 // ── Misc events collector ────────────────────────────────────────────────
 
-fn collect_misc_events(data_dir: &Path, user: &str, from_block: u64, to_block: u64, events: &mut BTreeMap<u64, Vec<Event>>) {
+fn collect_misc_events(
+    data_dir: &Path,
+    user: &str,
+    from_block: u64,
+    to_block: u64,
+    events: &mut BTreeMap<u64, Vec<Event>>,
+) {
     let misc_dir = data_dir.join("misc_events_streaming");
-    if !misc_dir.exists() { return; }
+    if !misc_dir.exists() {
+        return;
+    }
 
     let mut files = Vec::new();
     collect_files_recursive(&misc_dir, &mut files);
@@ -350,15 +427,21 @@ fn collect_misc_events(data_dir: &Path, user: &str, from_block: u64, to_block: u
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            if !line.to_lowercase().contains(user) { continue; }
+            if !line.to_lowercase().contains(user) {
+                continue;
+            }
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             let bn = val.get("block_number").and_then(|v| v.as_u64()).unwrap_or(0);
-            if bn <= from_block || bn > to_block { continue; }
+            if bn <= from_block || bn > to_block {
+                continue;
+            }
 
             let Some(evts) = val.get("events").and_then(|v| v.as_array()) else { continue };
             for ev in evts {
                 let ev_str = serde_json::to_string(ev).unwrap_or_default().to_lowercase();
-                if !ev_str.contains(user) { continue; }
+                if !ev_str.contains(user) {
+                    continue;
+                }
 
                 let Some(inner) = ev.get("inner").and_then(|v| v.as_object()) else { continue };
                 let Some((kind, payload)) = inner.iter().next() else { continue };
@@ -368,7 +451,9 @@ fn collect_misc_events(data_dir: &Path, user: &str, from_block: u64, to_block: u
                         if let Some(deltas) = payload.get("deltas").and_then(|v| v.as_array()) {
                             for d in deltas {
                                 let d_user = d.get("user").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                                if d_user != user { continue; }
+                                if d_user != user {
+                                    continue;
+                                }
                                 let coin = d.get("coin").and_then(|v| v.as_str()).unwrap_or("?");
                                 let amt = d.get("funding_amount").and_then(|v| v.as_str()).unwrap_or("?");
                                 let szi = d.get("szi").and_then(|v| v.as_str()).unwrap_or("?");
@@ -416,7 +501,9 @@ fn find_rmp(home_dir: &Path, block: u64) -> Option<PathBuf> {
     if analysis_dir.exists() {
         for entry in std::fs::read_dir(&analysis_dir).ok()?.flatten() {
             let rmp = entry.path().join(format!("{block}.rmp"));
-            if rmp.exists() { return Some(rmp); }
+            if rmp.exists() {
+                return Some(rmp);
+            }
         }
     }
 
@@ -427,7 +514,9 @@ fn find_rmp(home_dir: &Path, block: u64) -> Option<PathBuf> {
         dirs.sort_by_key(|e| e.file_name());
         for dir in dirs {
             let rmp = dir.path().join(format!("{block}.rmp"));
-            if rmp.exists() { return Some(rmp); }
+            if rmp.exists() {
+                return Some(rmp);
+            }
         }
     }
 

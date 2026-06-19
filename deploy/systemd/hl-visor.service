@@ -1,0 +1,28 @@
+[Unit]
+Description=hl-visor (Hyperliquid non-validator node supervisor)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alex
+ExecStart=/home/alex/hl-visor run-non-validator \
+    --write-fills --write-order-statuses --write-raw-book-diffs \
+    --stream-with-block-info --disable-output-file-buffering \
+    --replica-cmds-style actions-and-responses --serve-info \
+    --write-system-and-core-writer-actions --write-misc-events \
+    --write-hip3-oracle-updates
+# hl-visor spawns hl-node as a child and swaps its binary on network upgrades.
+Restart=always
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=60
+StandardOutput=append:/home/alex/logs/hl-visor.log
+StandardError=append:/home/alex/logs/hl-visor.log
+
+[Install]
+WantedBy=default.target
+
+# NOTE: Adopting this unit requires killing the current tmux-launched hl-visor +
+# hl-node and restarting under systemd -> a real node restart (catch-up time).
+# When using this unit, change hl_coordinator.sh's relaunch_visor to
+# `systemctl --user start hl-visor.service` instead of the setsid relaunch.

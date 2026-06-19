@@ -4,7 +4,7 @@ use crate::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
         FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, ORDERBOOK_BLOCK_SIZE_BYTES, ORDERBOOK_COINS_COUNT,
         ORDERBOOK_HEIGHT, ORDERBOOK_LATEST_DATA_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
-        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, PENDING_REMOVALS_CACHE,
     },
     order_book::{
         Coin, Px, Snapshot, Sz,
@@ -56,8 +56,7 @@ fn fetch_snapshot(
         let visor_path = get_visor_path(&snapshot_config);
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
-                let snapshot =
-                    load_snapshots_from_cli_json(&output_fln, &visor_path).await;
+                let snapshot = load_snapshots_from_cli_json(&output_fln, &visor_path).await;
                 info!("Snapshot fetched");
                 // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
@@ -91,6 +90,10 @@ pub(crate) struct OrderBookListener {
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     snapshot_tx: Option<Sender<Arc<SnapshotMessage>>>,
     hft_tx: Option<Sender<Arc<HftMessage>>>,
+    // Fills go on their own low-frequency channel so trades/allPrices/liq-map
+    // consumers don't have to drain the L4+BBO firehose (which made them lag and
+    // silently drop fills — ~50-70% trade loss).
+    fills_tx: Option<Sender<Arc<HftMessage>>>,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
     // Trigger snapshots are expensive — recompute less frequently and cache
@@ -99,13 +102,19 @@ pub(crate) struct OrderBookListener {
 }
 
 impl OrderBookListener {
-    pub(crate) fn new(snapshot_tx: Option<Sender<Arc<SnapshotMessage>>>, hft_tx: Option<Sender<Arc<HftMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(
+        snapshot_tx: Option<Sender<Arc<SnapshotMessage>>>,
+        hft_tx: Option<Sender<Arc<HftMessage>>>,
+        fills_tx: Option<Sender<Arc<HftMessage>>>,
+        ignore_spot: bool,
+    ) -> Self {
         Self {
             ignore_spot,
             order_book_state: None,
             fetched_snapshot_cache: None,
             snapshot_tx,
             hft_tx,
+            fills_tx,
             last_l2_broadcast: None,
             last_trigger_broadcast: None,
             cached_trigger_snapshots: Arc::new(HashMap::new()),
@@ -156,8 +165,19 @@ impl OrderBookListener {
 }
 
 impl OrderBookListener {
-    /// HFT version of process_data - doesn't skip first line errors since we're processing complete JSON lines
+    /// Process a single event and broadcast (for non-batched callers).
     pub(crate) fn process_data_hft(&mut self, line: String, event_source: EventSource) -> Result<()> {
+        self.process_data_hft_inner(line, event_source, false)
+    }
+
+    /// Process a single streaming event. When `skip_broadcast` is true, skips
+    /// L2 snapshot computation and BBO broadcast (caller will trigger after batch).
+    pub(crate) fn process_data_hft_inner(
+        &mut self,
+        line: String,
+        event_source: EventSource,
+        skip_broadcast: bool,
+    ) -> Result<()> {
         // Count events for debugging
         static HFT_EVENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = HFT_EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -283,8 +303,8 @@ impl OrderBookListener {
                     // Count fill events
                     EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
 
-                    // Broadcast fills immediately
-                    if let Some(tx) = &self.hft_tx {
+                    // Broadcast fills on their own low-frequency channel.
+                    if let Some(tx) = &self.fills_tx {
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             drop(tx.send(Arc::new(HftMessage::Fills { batch })));
@@ -320,6 +340,7 @@ impl OrderBookListener {
                 // Record health metrics
                 PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
                 PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
+                PENDING_REMOVALS_CACHE.set(state.pending_removals_count() as i64);
 
                 // Record orderbook stats
                 ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
@@ -340,7 +361,7 @@ impl OrderBookListener {
 
         // Fast BBO broadcast - ONLY for coins that changed!
         // No throttle needed since we only compute BBO for changed coins (usually 1-2)
-        if !changed_coins.is_empty() {
+        if !skip_broadcast && !changed_coins.is_empty() {
             if let Some(state) = &self.order_book_state {
                 let bbo_start = Instant::now();
                 let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
@@ -363,7 +384,7 @@ impl OrderBookListener {
         // Throttled L2 snapshot broadcast for L2Book subscribers
         // l2_snapshots_uncached() is expensive, so limit to 100 broadcasts/sec max (10ms interval)
         let should_broadcast_l2 =
-            self.last_l2_broadcast.map(|t| t.elapsed() >= Duration::from_millis(10)).unwrap_or(true);
+            !skip_broadcast && self.last_l2_broadcast.map(|t| t.elapsed() >= Duration::from_millis(10)).unwrap_or(true);
 
         if should_broadcast_l2 {
             if let Some(state) = &self.order_book_state {
@@ -419,28 +440,16 @@ pub(crate) struct TimedSnapshots {
 
 /// Snapshot-based messages (L2/trigger/BBO) — low frequency (~10-100/sec)
 pub(crate) enum SnapshotMessage {
-    Snapshot {
-        l2_snapshots: L2Snapshots,
-        trigger_snapshots: Arc<TriggerSnapshots>,
-        time: u64,
-    },
+    Snapshot { l2_snapshots: L2Snapshots, trigger_snapshots: Arc<TriggerSnapshots>, time: u64 },
+    LiquidationMaps { maps: Vec<crate::types::LiquidationMapData>, l4_maps: Vec<crate::types::L4LiquidationMapData> },
 }
 
 /// HFT streaming messages (L4/fills/BBO/orderUpdates) — high frequency (~1000+/sec)
 pub(crate) enum HftMessage {
-    BboUpdate {
-        bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
-        time: u64,
-    },
-    Fills {
-        batch: Batch<NodeDataFill>,
-    },
-    L4OrderDiffs {
-        batch: Batch<NodeDataOrderDiff>,
-    },
-    L4OrderStatuses {
-        batch: Batch<NodeDataOrderStatus>,
-    },
+    BboUpdate { bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>, time: u64 },
+    Fills { batch: Batch<NodeDataFill> },
+    L4OrderDiffs { batch: Batch<NodeDataOrderDiff> },
+    L4OrderStatuses { batch: Batch<NodeDataOrderStatus> },
 }
 
 #[derive(Eq, PartialEq, Hash)]
@@ -527,27 +536,33 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         tokio::select! {
             biased;
 
-            // Process events from file watchers (via bridge)
-            Some(event) = tokio_rx.recv() => {
-                match event {
-                    parallel::FileEvent::OrderDiff(line) => {
-                        // Process OrderDiff immediately - this is the BBO-critical path
-                        if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::OrderDiffs) {
-                            error!("OrderDiff error: {err}");
-                        }
+            // Process events from file watchers (via bridge).
+            // Drain all available events and process in a single lock acquisition
+            // to minimize mutex contention under load.
+            Some(first_event) = tokio_rx.recv() => {
+                let mut batch = vec![first_event];
+                while let Ok(event) = tokio_rx.try_recv() {
+                    batch.push(event);
+                }
+                let batch_len = batch.len();
+
+                let mut listener = listener.lock().await;
+                for (i, event) in batch.into_iter().enumerate() {
+                    let is_last = i == batch_len - 1;
+                    let (line, source) = match event {
+                        parallel::FileEvent::OrderDiff(l) => (l, EventSource::OrderDiffs),
+                        parallel::FileEvent::OrderStatus(l) => (l, EventSource::OrderStatuses),
+                        parallel::FileEvent::Fill(l) => (l, EventSource::Fills),
+                    };
+                    // Skip broadcast for all but the last event — L2/BBO computed once per batch
+                    if let Err(err) = listener.process_data_hft_inner(line, source, !is_last) {
+                        error!("{source} error: {err}");
                     }
-                    parallel::FileEvent::OrderStatus(line) => {
-                        // OrderStatuses are less latency-critical
-                        if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::OrderStatuses) {
-                            error!("OrderStatus error: {err}");
-                        }
-                    }
-                    parallel::FileEvent::Fill(line) => {
-                        // Fills are for trade data, not BBO
-                        if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::Fills) {
-                            error!("Fill error: {err}");
-                        }
-                    }
+                }
+                drop(listener);
+
+                if batch_len > 100 {
+                    log::debug!("Processed batch of {} events", batch_len);
                 }
             }
 

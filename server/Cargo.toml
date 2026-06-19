@@ -27,6 +27,10 @@ sonic-rs = "0.3"
 rocksdb = "0.22"
 rmp = "0.8"
 ureq = { version = "2", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -105,10 +105,7 @@ async fn main() {
 async fn run(args: Args) -> Result<(), String> {
     initialize_db(&args.db_path)?;
 
-    let bind_addr: SocketAddr = args
-        .bind
-        .parse()
-        .map_err(|err| format!("invalid --bind '{}': {err}", args.bind))?;
+    let bind_addr: SocketAddr = args.bind.parse().map_err(|err| format!("invalid --bind '{}': {err}", args.bind))?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
@@ -135,12 +132,9 @@ async fn run(args: Args) -> Result<(), String> {
         poll_loop(poller_args, client).await;
     }));
 
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .map_err(|err| format!("failed to bind {bind_addr}: {err}"))?;
-    axum::serve(listener, router)
-        .await
-        .map_err(|err| format!("http server error: {err}"))
+    let listener =
+        tokio::net::TcpListener::bind(bind_addr).await.map_err(|err| format!("failed to bind {bind_addr}: {err}"))?;
+    axum::serve(listener, router).await.map_err(|err| format!("http server error: {err}"))
 }
 
 async fn poll_loop(args: Args, client: Client) {
@@ -201,11 +195,7 @@ async fn poll_loop(args: Args, client: Client) {
                 };
                 persist_sample(args.db_path.clone(), sample).await;
 
-                println!(
-                    "[{}] \x1b[31;1mDOWN\x1b[0m       | {}",
-                    fmt_time(now_ms),
-                    err,
-                );
+                println!("[{}] \x1b[31;1mDOWN\x1b[0m       | {}", fmt_time(now_ms), err,);
             }
         }
 
@@ -236,9 +226,7 @@ fn colored_status(status: &str) -> &'static str {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 fn to_i64(value: u64) -> i64 {
@@ -275,10 +263,8 @@ async fn fetch_status(client: &Client, node_info_url: &str) -> Result<(u64, Opti
         .await
         .map_err(|err| format!("json: {err}"))?;
 
-    let block_time_ms = resp
-        .get("time")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("missing or invalid 'time' field".to_string())?;
+    let block_time_ms =
+        resp.get("time").and_then(serde_json::Value::as_u64).ok_or("missing or invalid 'time' field".to_string())?;
 
     // activeAssetData returns current mark price
     let body = serde_json::json!({
@@ -299,21 +285,16 @@ async fn fetch_status(client: &Client, node_info_url: &str) -> Result<(u64, Opti
         .map_err(|err| format!("mark json: {err}"))?;
 
     let mark_px = resp.get("markPx").and_then(|value| {
-        if let Some(px) = value.as_f64() {
-            Some(px)
-        } else {
-            value.as_str().and_then(|px| px.parse::<f64>().ok())
-        }
+        if let Some(px) = value.as_f64() { Some(px) } else { value.as_str().and_then(|px| px.parse::<f64>().ok()) }
     });
 
     Ok((block_time_ms, mark_px))
 }
 
 fn open_connection(db_path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(db_path)
-        .map_err(|err| format!("failed to open sqlite db '{}': {err}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(2))
-        .map_err(|err| format!("failed to set sqlite busy_timeout: {err}"))?;
+    let conn =
+        Connection::open(db_path).map_err(|err| format!("failed to open sqlite db '{}': {err}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(2)).map_err(|err| format!("failed to set sqlite busy_timeout: {err}"))?;
     Ok(conn)
 }
 
@@ -419,11 +400,8 @@ fn build_summary(window_minutes: u32, samples: &[SampleRow]) -> SeriesSummary {
     let mut lags: Vec<i64> = samples.iter().filter_map(|sample| sample.lag_seconds).collect();
     lags.sort_unstable();
 
-    let avg_lag_seconds = if lags.is_empty() {
-        None
-    } else {
-        Some(lags.iter().sum::<i64>() as f64 / lags.len() as f64)
-    };
+    let avg_lag_seconds =
+        if lags.is_empty() { None } else { Some(lags.iter().sum::<i64>() as f64 / lags.len() as f64) };
 
     let p95_lag_seconds = if lags.is_empty() {
         None
@@ -475,19 +453,13 @@ async fn latest_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn series_handler(
-    State(state): State<AppState>,
-    Query(query): Query<SeriesQuery>,
-) -> impl IntoResponse {
+async fn series_handler(State(state): State<AppState>, Query(query): Query<SeriesQuery>) -> impl IntoResponse {
     let query = resolve_series_query(query);
     let db_path = state.db_path.clone();
 
     match tokio::task::spawn_blocking(move || load_series(&db_path, query)).await {
         Ok(Ok(samples)) => {
-            let response = SeriesResponse {
-                summary: build_summary(query.minutes, &samples),
-                samples,
-            };
+            let response = SeriesResponse { summary: build_summary(query.minutes, &samples), samples };
             (StatusCode::OK, Json(response)).into_response()
         }
         Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),

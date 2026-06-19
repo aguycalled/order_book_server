@@ -25,10 +25,7 @@ fn main() {
     }
 
     if positional.len() < 2 {
-        eprintln!(
-            "Usage: {} [--raw] <rmp_file> <user_address> [user_address...]",
-            args[0]
-        );
+        eprintln!("Usage: {} [--raw] <rmp_file> <user_address> [user_address...]", args[0]);
         std::process::exit(1);
     }
 
@@ -52,8 +49,8 @@ fn main() {
                         if valid_json {
                             if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_part) {
                                 let prefix = &line[..json_start];
-                                let pretty = serde_json::to_string_pretty(&val)
-                                    .unwrap_or_else(|_| json_part.to_string());
+                                let pretty =
+                                    serde_json::to_string_pretty(&val).unwrap_or_else(|_| json_part.to_string());
                                 // Use original line's leading whitespace + 4 for continuation
                                 let base_indent = line.len() - line.trim_start().len();
                                 let pad: String = " ".repeat(base_indent + 4);
@@ -115,7 +112,12 @@ fn main() {
                     let max_lev = mt.and_then(|t| t.first()).map(|t| t.max_leverage);
                     println!(
                         "    pos[{}] {}: szi={} cb={} lev={:?} funding={} max_lev={}",
-                        k, coin, p.szi, p.cost_basis, p.leverage, p.outstanding_funding,
+                        k,
+                        coin,
+                        p.szi,
+                        p.cost_basis,
+                        p.leverage,
+                        p.outstanding_funding,
                         max_lev.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string())
                     );
                 }
@@ -129,7 +131,9 @@ fn main() {
                         let max_lev = mt.and_then(|t| t.first()).map(|t| t.max_leverage);
                         println!(
                             "    lev_setting[{}] {}: {:?} max_lev={}",
-                            k, coin, lev,
+                            k,
+                            coin,
+                            lev,
                             max_lev.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string())
                         );
                     }
@@ -149,7 +153,9 @@ fn main() {
                     let max_lev = mt.and_then(|t| t.first()).map(|t| t.max_leverage);
                     println!(
                         "    lev_setting[{}] {}: {:?} max_lev={}",
-                        k, coin, lev,
+                        k,
+                        coin,
+                        lev,
                         max_lev.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string())
                     );
                 }
@@ -174,7 +180,12 @@ fn main() {
                         if let Some(tiers) = dex.margin_tables.get(table_id) {
                             let tier_strs: Vec<String> = tiers
                                 .iter()
-                                .map(|t| format!("{{lb={}, max_lev={}, maint_ded={}}}", t.lower_bound, t.max_leverage, t.maintenance_deduction))
+                                .map(|t| {
+                                    format!(
+                                        "{{lb={}, max_lev={}, maint_ded={}}}",
+                                        t.lower_bound, t.max_leverage, t.maintenance_deduction
+                                    )
+                                })
                                 .collect();
                             println!("    table[{}]: [{}]", table_id, tier_strs.join(", "));
                         }

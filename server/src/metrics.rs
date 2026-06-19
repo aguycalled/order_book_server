@@ -113,10 +113,22 @@ lazy_static! {
         "Pending order diffs in HFT cache"
     ).expect("metric can be created");
 
+    /// Tombstones for oids whose Remove arrived before New+Status pairing
+    pub static ref PENDING_REMOVALS_CACHE: IntGauge = IntGauge::new(
+        "pending_removals_cache_size",
+        "Out-of-order Remove tombstones awaiting late New/Status events"
+    ).expect("metric can be created");
+
     /// Broadcast channel lag (receivers behind)
     pub static ref CHANNEL_LAG: IntGauge = IntGauge::new(
         "broadcast_channel_lag",
         "Broadcast channel lag"
+    ).expect("metric can be created");
+
+    /// Event processing queue depth (events read from disk but not yet processed)
+    pub static ref EVENT_QUEUE_DEPTH: IntGauge = IntGauge::new(
+        "event_queue_depth",
+        "Events queued for processing (backlog between file watchers and event loop)"
     ).expect("metric can be created");
 
     // ==================== ERROR METRICS ====================
@@ -219,6 +231,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(ORDERBOOK_BLOCK_SIZE_BYTES.clone())).ok();
     REGISTRY.register(Box::new(PENDING_ORDERS_CACHE.clone())).ok();
     REGISTRY.register(Box::new(PENDING_DIFFS_CACHE.clone())).ok();
+    REGISTRY.register(Box::new(PENDING_REMOVALS_CACHE.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_LAG.clone())).ok();
 
     // Error metrics

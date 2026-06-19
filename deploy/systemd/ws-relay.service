@@ -1,0 +1,23 @@
+[Unit]
+Description=ws-relay (order book WS fan-out tier in front of core :8000)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alex/order_book_server_v2
+ExecStart=/home/alex/order_book_server_v2/target/release/ws_relay \
+    --listen 127.0.0.1:8100 \
+    --upstream ws://127.0.0.1:8000/ws \
+    --max-conns 20000 \
+    --max-conns-per-ip 200
+# Self-heals if the core is down (upstream auto-reconnects with backoff), so it
+# does not need the hl-coordinator; just keep it running.
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+Environment=RUST_LOG=info
+StandardOutput=append:/home/alex/logs/ws-relay.log
+StandardError=append:/home/alex/logs/ws-relay.log
+
+[Install]
+WantedBy=default.target

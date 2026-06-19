@@ -1,0 +1,18 @@
+[Unit]
+Description=hl-coordinator (keep hl-visor alive, coordinate orderbook around hl-node restarts)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/alex/bin/hl_coordinator.sh
+Restart=always
+RestartSec=10
+# Set DRY_RUN=1 here (or via drop-in) to validate decisions without acting.
+Environment=DRY_RUN=0
+Environment=HL_COORD_INTERVAL=15
+Environment=HL_STALE=60
+StandardOutput=append:/home/alex/logs/hl-coordinator.log
+StandardError=append:/home/alex/logs/hl-coordinator.log
+
+[Install]
+WantedBy=default.target
