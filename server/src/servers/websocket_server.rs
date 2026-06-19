@@ -375,8 +375,11 @@ async fn handle_socket(
     }
     loop {
         select! {
-            biased;
-            // Snapshot channel: L2/trigger (low frequency) — PRIORITIZED
+            // NOTE: not `biased`. With biased + the socket read listed last, a
+            // busy feed kept the broadcast branches always-ready and starved the
+            // socket read, so client disconnects were never detected and the
+            // connections leaked (CLOSE_WAIT), eventually saturating the server.
+            // Fair selection guarantees the read branch is serviced.
             recv_result = snapshot_rx.recv() => {
                 match recv_result {
                     Ok(msg) => match msg.as_ref() {
