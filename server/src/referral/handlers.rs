@@ -100,6 +100,27 @@ pub async fn stats_top_handler(Query(q): Query<TopQuery>, State(db): State<Arc<R
     axum::response::Json(out).into_response()
 }
 
+/// One day in the growth time-series.
+#[derive(Serialize)]
+struct GrowthEntry {
+    date: String,
+    /// Cumulative users under the tracked referral code as of this day.
+    referral: u64,
+    /// Cumulative users who approved our builder fee as of this day.
+    builder: u64,
+}
+
+/// GET /stats/growth — daily cumulative counts of referral sign-ups + builder
+/// approvals over time (for the /stats growth chart).
+pub async fn stats_growth_handler(State(db): State<Arc<ReferralStatsDb>>) -> impl IntoResponse {
+    let out: Vec<GrowthEntry> = db
+        .growth_series()
+        .into_iter()
+        .map(|(day, p)| GrowthEntry { date: epoch_day_to_date(day), referral: p.referral, builder: p.builder })
+        .collect();
+    axum::response::Json(out).into_response()
+}
+
 /// One referee in a referral-accrual batch query.
 #[derive(Deserialize)]
 pub struct AccrualUser {

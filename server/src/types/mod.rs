@@ -30,6 +30,15 @@ pub(crate) struct Trade {
     /// [buyer, seller] signed position size BEFORE this fill (from the node).
     /// Combined with `dir` + `sz` the UI can show positioning. Notional is px*sz.
     start_positions: [String; 2],
+    /// Liquidation flag: 1 if either fill was a liquidation (node `liquidation`
+    /// field), else omitted. Kept tiny on the wire — key `l`, value 1, absent
+    /// for normal trades.
+    #[serde(rename = "l", default, skip_serializing_if = "is_zero")]
+    liquidation: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,9 +173,13 @@ impl Trade {
         let mut seller_sp = String::new();
         let mut taker_side: Option<Side> = None;
         let mut rep: Option<&Fill> = None;
+        let mut is_liq = false;
 
         for NodeDataFill(user, f) in group {
             rep = Some(f);
+            if f.liquidation.is_some() {
+                is_liq = true;
+            }
             match f.side {
                 Side::Bid => {
                     buyer = *user;
@@ -196,6 +209,7 @@ impl Trade {
             users: [buyer, seller],
             dirs: [buyer_dir, seller_dir],
             start_positions: [buyer_sp, seller_sp],
+            liquidation: u8::from(is_liq),
         })
     }
 

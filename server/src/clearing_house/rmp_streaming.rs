@@ -299,6 +299,138 @@ pub fn extract_referrer_users_by_code(path: &Path, code: &str) -> Result<(Option
     Ok((None, HashSet::new()))
 }
 
+/// Scan `exchange.locus.ftr.user_states` and return the set of users who have
+/// `builder_hex` in their builder-fee approvals (the per-user `"m"` map). Fast
+/// streaming scan (~2s for 1.5M users). Addresses returned lowercased with 0x.
+pub fn extract_builder_approval_users(path: &Path, builder_hex: &str) -> Result<HashSet<String>> {
+    let needle = builder_hex.to_lowercase().into_bytes();
+    let data = fs::read(path)?;
+    let mut cur = &data[..];
+    map_seek(&mut cur, "exchange")?;
+    let en = read_map_len(&mut cur)?;
+    let mut out = HashSet::new();
+    for _ in 0..en {
+        let ek = read_str_ref(&mut cur)?.to_string();
+        if ek != "locus" {
+            skip_value(&mut cur)?;
+            continue;
+        }
+        let ln = read_map_len(&mut cur)?;
+        for _ in 0..ln {
+            let lk = read_str_ref(&mut cur)?.to_string();
+            if lk != "ftr" {
+                skip_value(&mut cur)?;
+                continue;
+            }
+            let fnn = read_map_len(&mut cur)?;
+            for _ in 0..fnn {
+                let fk = read_str_ref(&mut cur)?.to_string();
+                if fk != "user_states" {
+                    skip_value(&mut cur)?;
+                    continue;
+                }
+                let n = read_array_len(&mut cur)?;
+                for _ in 0..n {
+                    let pn = read_array_len(&mut cur)?;
+                    let addr = read_str(&mut cur)?.to_lowercase();
+                    let mut has_builder = false;
+                    for _ in 1..pn {
+                        let sub = capture_subtree(&mut cur)?;
+                        let mut sc = &sub[..];
+                        if let Ok(sn) = read_map_len(&mut sc) {
+                            for _ in 0..sn {
+                                let is_m = read_str_ref(&mut sc).map(|k| k == "m").unwrap_or(false);
+                                let v = capture_subtree(&mut sc).unwrap_or_default();
+                                if is_m && contains_subslice(&v, &needle) {
+                                    has_builder = true;
+                                }
+                            }
+                        }
+                    }
+                    if has_builder {
+                        out.insert(addr);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Debug: dump the `exchange.locus.*` keys and `exchange.locus.ftr.*` keys so we
+/// can locate where builder-fee approvals live in the ABCI state.
+pub fn dump_locus_ftr_keys(path: &Path) -> Result<()> {
+    let data = fs::read(path)?;
+    let mut cur = &data[..];
+    map_seek(&mut cur, "exchange")?;
+    let en = read_map_len(&mut cur)?;
+    for _ in 0..en {
+        let ek = read_str_ref(&mut cur)?.to_string();
+        if ek != "locus" {
+            skip_value(&mut cur)?;
+            continue;
+        }
+        let ln = read_map_len(&mut cur)?;
+        for _ in 0..ln {
+            let lk = read_str_ref(&mut cur)?.to_string();
+            println!("locus key = {lk:?}");
+            if lk == "ftr" {
+                let fnn = read_map_len(&mut cur)?;
+                for _ in 0..fnn {
+                    let fk = read_str_ref(&mut cur)?.to_string();
+                    println!("  ftr key = {fk:?}");
+                    if fk == "user_states" {
+                        // Count users whose "m" (builder-fee approvals) map contains
+                        // our builder — validates the extractor + gives the baseline.
+                        let needle = b"0x74c362cd3a141769f38c48d66ee51b1938ea4bd0";
+                        let n = read_array_len(&mut cur)?;
+                        let mut approvers = 0usize;
+                        for _ in 0..n {
+                            let pn = read_array_len(&mut cur)?;
+                            let _addr = read_str(&mut cur)?;
+                            let mut has_builder = false;
+                            for _ in 1..pn {
+                                let sub = capture_subtree(&mut cur)?;
+                                let mut sc = &sub[..];
+                                if let Ok(sn) = read_map_len(&mut sc) {
+                                    for _ in 0..sn {
+                                        let is_m = read_str_ref(&mut sc).map(|k| k == "m").unwrap_or(false);
+                                        let v = capture_subtree(&mut sc).unwrap_or_default();
+                                        if is_m && contains_subslice(&v, needle) {
+                                            has_builder = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if has_builder {
+                                approvers += 1;
+                            }
+                        }
+                        println!("    BUILDER APPROVERS (m contains our builder) = {approvers} / {n} users");
+                    } else {
+                        skip_value(&mut cur)?;
+                    }
+                }
+            } else {
+                skip_value(&mut cur)?;
+            }
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
 fn parse_referrer_entry(raw: &[u8]) -> Result<(String, HashSet<String>)> {
     let mut cur = raw;
     let n = read_map_len(&mut cur)?;

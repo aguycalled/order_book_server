@@ -408,6 +408,10 @@ pub fn extract_raw_debug_users_from_rmp(
     rmp_streaming::extract_raw_debug_users_from_rmp(path, debug_users)
 }
 
+pub fn dump_locus_ftr_keys(path: &Path) -> Result<()> {
+    rmp_streaming::dump_locus_ftr_keys(path)
+}
+
 pub fn extract_raw_debug_misc_events(
     data_dir: &Path,
     debug_users: &std::collections::HashSet<String>,

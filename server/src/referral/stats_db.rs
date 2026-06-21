@@ -188,6 +188,55 @@ impl ReferralStatsDb {
         all.truncate(limit);
         all
     }
+
+    // ── Daily growth time-series ────────────────────────────────────────────
+    // Key: b"growth:" + 4-byte big-endian day (since epoch). Value: GrowthPoint.
+    // 11-byte keys never collide with the 20/24-byte address rows above.
+
+    /// Write (overwrite) the cumulative counts for a given UTC day.
+    pub fn write_growth(&self, day: u32, referral: u64, builder: u64) {
+        let mut key = GROWTH_PREFIX.to_vec();
+        key.extend_from_slice(&day.to_be_bytes());
+        let point = GrowthPoint { referral, builder };
+        match serde_json::to_vec(&point) {
+            Ok(v) => {
+                if let Err(e) = self.db.put(&key, v) {
+                    error!("stats_db: growth write error: {e}");
+                }
+            }
+            Err(e) => warn!("stats_db: growth serialize error: {e}"),
+        }
+    }
+
+    /// All recorded growth points, oldest day first.
+    pub fn growth_series(&self) -> Vec<(u32, GrowthPoint)> {
+        let iter = self
+            .db
+            .iterator(rocksdb::IteratorMode::From(GROWTH_PREFIX, rocksdb::Direction::Forward));
+        let mut out = Vec::new();
+        for item in iter {
+            let Ok((k, v)) = item else { break };
+            if !k.starts_with(GROWTH_PREFIX) || k.len() != GROWTH_PREFIX.len() + 4 {
+                if k.starts_with(GROWTH_PREFIX) {
+                    continue;
+                }
+                break;
+            }
+            let day = u32::from_be_bytes([k[7], k[8], k[9], k[10]]);
+            if let Ok(p) = serde_json::from_slice::<GrowthPoint>(&v) {
+                out.push((day, p));
+            }
+        }
+        out
+    }
+}
+
+const GROWTH_PREFIX: &[u8] = b"growth:";
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct GrowthPoint {
+    pub referral: u64,
+    pub builder: u64,
 }
 
 pub type SharedReferralStatsDb = Arc<ReferralStatsDb>;

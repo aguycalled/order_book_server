@@ -15,13 +15,24 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let mut raw_mode = false;
+    let mut structure_mode = false;
     let mut positional = Vec::new();
     for arg in &args[1..] {
         if arg == "--raw" {
             raw_mode = true;
+        } else if arg == "--structure" {
+            structure_mode = true;
         } else {
             positional.push(arg.clone());
         }
+    }
+
+    if structure_mode {
+        let path = PathBuf::from(positional.first().cloned().unwrap_or_default());
+        if let Err(e) = clearing_house::dump_locus_ftr_keys(&path) {
+            eprintln!("dump failed: {e}");
+        }
+        return;
     }
 
     if positional.len() < 2 {

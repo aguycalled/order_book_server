@@ -16,7 +16,8 @@ pub mod stats_db;
 
 pub use aggregator::spawn_referral_consumer;
 pub use handlers::{
-    stats_referral_accrual_handler, stats_top_handler, stats_user_daily_handler, stats_user_handler,
+    stats_growth_handler, stats_referral_accrual_handler, stats_top_handler,
+    stats_user_daily_handler, stats_user_handler,
 };
-pub use referrer_tracker::{ReferrerTracker, spawn_referrer_tailer};
+pub use referrer_tracker::{ReferrerTracker, spawn_growth_recorder, spawn_referrer_tailer};
 pub use stats_db::{ReferralStatsDb, UserStats};

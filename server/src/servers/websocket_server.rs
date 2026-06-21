@@ -42,7 +42,8 @@ use crate::ServerConfig;
 use crate::clearing_house::liquidation_map;
 use crate::referral::{
     ReferralStatsDb, ReferrerTracker, spawn_referral_consumer, spawn_referrer_tailer,
-    stats_referral_accrual_handler, stats_top_handler, stats_user_daily_handler, stats_user_handler,
+    stats_growth_handler, stats_referral_accrual_handler, stats_top_handler,
+    stats_user_daily_handler, stats_user_handler,
 };
 use crate::strategy::{StrategyStatsDb, stats_strategy_batch_handler, stats_strategy_handler};
 
@@ -178,21 +179,25 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         use crate::clearing_house::find_all_rmp_files;
         match find_all_rmp_files(&home_dir) {
             Ok(files) => match files.last() {
-                Some(latest_rmp) => match ReferrerTracker::from_snapshot(latest_rmp, &config.track_referral_code) {
+                Some(latest_rmp) => match ReferrerTracker::from_snapshot(
+                    latest_rmp,
+                    &config.track_referral_code,
+                    &config.track_builder_address,
+                ) {
                     Ok(t) => Arc::new(t),
                     Err(e) => {
                         error!("Failed to seed ReferrerTracker from {}: {e}; starting empty", latest_rmp.display());
-                        Arc::new(ReferrerTracker::empty(&config.track_referral_code))
+                        Arc::new(ReferrerTracker::empty(&config.track_referral_code, &config.track_builder_address))
                     }
                 },
                 None => {
                     error!("No RMP files found; ReferrerTracker starting empty");
-                    Arc::new(ReferrerTracker::empty(&config.track_referral_code))
+                    Arc::new(ReferrerTracker::empty(&config.track_referral_code, &config.track_builder_address))
                 }
             },
             Err(e) => {
                 error!("find_all_rmp_files failed: {e}; ReferrerTracker starting empty");
-                Arc::new(ReferrerTracker::empty(&config.track_referral_code))
+                Arc::new(ReferrerTracker::empty(&config.track_referral_code, &config.track_builder_address))
             }
         }
     };
@@ -200,6 +205,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // Spawn subsystems. The fill consumer reads the builder address and exact
     // builder fee directly off each fill — no order-status cache, no race.
     spawn_referrer_tailer(referrer_tracker.clone(), home_dir.clone());
+    crate::referral::spawn_growth_recorder(referrer_tracker.clone(), referral_stats_db.clone());
     spawn_referral_consumer(
         referral_stats_db.clone(),
         strategy_stats_db.clone(),
@@ -274,6 +280,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         .route("/stats/user/{addr}", get(stats_user_handler))
         .route("/stats/user/{addr}/daily", get(stats_user_daily_handler))
         .route("/stats/top", get(stats_top_handler))
+        .route("/stats/growth", get(stats_growth_handler))
         .route("/stats/referral/accrual", axum::routing::post(stats_referral_accrual_handler))
         .with_state(referral_stats_db);
 
